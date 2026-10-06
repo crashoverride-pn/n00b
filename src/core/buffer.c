@@ -208,24 +208,21 @@ n00b_buffer_len(n00b_buffer_t *buffer)
 #define BUFFER_ALIASES (N00B_BUF_F_MMAP | N00B_BUF_F_BORROWED)
 
 // Release the storage a regrow path has just copied out of. The buffer's data
-// is heap memory from here on, so a mapping is unmapped and a borrowed slice
-// leaves its parent alone; either way the flag is cleared. Heap storage goes
-// back through buffer->allocator directly, which skips the global mmap
-// interval-tree search in the general n00b_free path (a nullptr allocator
-// falls back to the discovering path, which is correct for runtime-default
-// buffers).
+// is heap memory from here on, so a mapping is unmapped, a borrowed parent is
+// left alone, and both alias flags are cleared. Heap storage goes back through
+// buffer->allocator directly, which skips the global mmap interval-tree search
+// in the general n00b_free path (a nullptr allocator falls back to the
+// discovering path, which is correct for runtime-default buffers).
 static void
 buffer_release_old_data(n00b_buffer_t *buffer)
 {
     if (buffer->flags & N00B_BUF_F_MMAP) {
         n00b_buffer_mmap_release(buffer);
     }
-    else if (buffer->flags & N00B_BUF_F_BORROWED) {
-        buffer->flags &= (uint32_t)~N00B_BUF_F_BORROWED;
-    }
-    else if (buffer->data) {
+    else if (!(buffer->flags & N00B_BUF_F_BORROWED) && buffer->data) {
         n00b_free(buffer->data, .allocator = buffer->allocator);
     }
+    buffer->flags &= (uint32_t)~BUFFER_ALIASES;
 }
 
 // Give a mapping or borrowed slice its own heap copy before an in-place write.

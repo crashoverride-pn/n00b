@@ -628,6 +628,35 @@ test_mutating_a_borrowed_slice_copies_it(void)
     printf("  [PASS] mutating_a_borrowed_slice_copies_it\n");
 }
 
+// A mapping that also carries the borrowed flag drops both once it is copied,
+// so a second mutation treats the copy as owned.
+static void
+test_mapping_marked_borrowed_drops_both_flags(void)
+{
+    const char     contents[] = "mapped and borrowed";
+    size_t         n          = strlen(contents);
+    n00b_string_t *p          = write_temp_file(contents, n);
+
+    auto br = n00b_file_mmap(p);
+    assert(n00b_result_is_ok(br));
+    n00b_buffer_t *buf = n00b_result_get(br);
+    buf->flags |= N00B_BUF_F_BORROWED;
+
+    n00b_buffer_append_bytes(buf, "!", 1);
+    assert(!(buf->flags & (N00B_BUF_F_MMAP | N00B_BUF_F_BORROWED)));
+
+    char *copy = buf->data;
+    assert(n00b_result_is_ok(n00b_buffer_set_index(buf, 0, 'M')));
+    assert(buf->data == copy);
+    assert(n00b_buffer_len(buf) == (int64_t)n + 1);
+    assert(memcmp(buf->data, "Mapped and borrowed!", n + 1) == 0);
+
+    n00b_buffer_free(buf);
+    unlink_path(p);
+    fflush(stdout);
+    printf("  [PASS] mapping_marked_borrowed_drops_both_flags\n");
+}
+
 typedef enum {
     VIEW_GROW,
     VIEW_SHRINK,
@@ -1244,6 +1273,7 @@ main(int argc, char **argv)
     test_free_with_allocator_hint_releases_mapping();
     test_mutating_a_mapping_copies_it();
     test_mutating_a_borrowed_slice_copies_it();
+    test_mapping_marked_borrowed_drops_both_flags();
     test_file_view_copied_to_heap_is_ebadf();
     test_shrinking_a_mapping_stays_in_bounds();
     test_read_after_mmap_release_is_ebadf();
