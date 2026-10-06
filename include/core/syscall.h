@@ -26,6 +26,10 @@
 #include <stdint.h>      // uintptr_t
 #include <sys/syscall.h> // SYS_write / SYS_exit / SYS_exit_group
 
+/// Where poll(2) cannot report the time left, a signal restarts the whole
+/// timeout of _n00b_raw_poll_one, at most this many times per call.
+#define N00B_RAW_POLL_MAX_RESTARTS 64
+
 #if defined(__APPLE__) && defined(__aarch64__)
 
 // Raw BSD syscall via the arm64 unix trap (x16 = number, svc #0x80), returning
@@ -109,10 +113,10 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
     return failed ? -1 : x0;
 }
 
-/// poll(2) on one descriptor: the ready count, or -errno.  Reads the carry
-/// flag for the same reason _n00b_raw_write_once does.
+/// One SYS_poll on one descriptor: the ready count, or -errno.  Reads the
+/// carry flag for the same reason _n00b_raw_write_once does.
 static inline long
-_n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
+_n00b_raw_poll_once(struct pollfd *pfd, int timeout_ms)
 {
     register long x16 __asm__("x16") = SYS_poll;
     register long x0 __asm__("x0")   = (long)(uintptr_t)pfd;
@@ -127,6 +131,22 @@ _n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
                      : "cc", "memory");
 
     return failed ? -x0 : x0;
+}
+
+/// poll(2) on one descriptor: the ready count, or -errno.  A negative
+/// @p timeout_ms waits indefinitely.  A signal restarts the wait, up to
+/// N00B_RAW_POLL_MAX_RESTARTS times.
+static inline long
+_n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
+{
+    long r;
+    int  restarts = 0;
+
+    do {
+        r = _n00b_raw_poll_once(pfd, timeout_ms);
+    } while (r == -EINTR && restarts++ < N00B_RAW_POLL_MAX_RESTARTS);
+
+    return r;
 }
 
 /// Libc-free immediate whole-process exit (kernel `exit`, no atexit handlers).
@@ -340,21 +360,34 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
     return n < 0 ? -1 : n;
 }
 
-/// poll(2) on one descriptor: the ready count, or -errno.  ppoll, because
-/// arm64 has no SYS_poll.
+/// poll(2) on one descriptor: the ready count, or -errno.  A negative
+/// @p timeout_ms waits indefinitely.  ppoll, because arm64 has no SYS_poll.
+///
+/// A signal does not end the wait early, which matters because the
+/// stop-the-world signal reaches every thread on each collection: ppoll
+/// writes the time left back into `ts`, so the retry waits only for the
+/// rest of @p timeout_ms.
 static inline long
 _n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
 {
     struct {
         long tv_sec;
         long tv_nsec;
-    } ts = {timeout_ms / 1000, (long)(timeout_ms % 1000) * 1000000L};
+    } ts = {0, 0};
+    long tsp = 0;
 
-    return _n00b_raw_linux_syscall4(SYS_ppoll,
-                                    (long)(uintptr_t)pfd,
-                                    1,
-                                    (long)(uintptr_t)&ts,
-                                    0);
+    if (timeout_ms >= 0) {
+        ts.tv_sec  = timeout_ms / 1000;
+        ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+        tsp        = (long)(uintptr_t)&ts;
+    }
+
+    long r;
+    do {
+        r = _n00b_raw_linux_syscall4(SYS_ppoll, (long)(uintptr_t)pfd, 1, tsp, 0);
+    } while (r == -EINTR);
+
+    return r;
 }
 
 [[noreturn]] static inline void
@@ -385,12 +418,23 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
     return (long)syscall(SYS_write, fd, buf, len);
 }
 
-/// poll(2) on one descriptor: the ready count, or -errno.
+/// poll(2) on one descriptor: the ready count, or -errno.  A negative
+/// @p timeout_ms waits indefinitely.  A signal restarts the wait, up to
+/// N00B_RAW_POLL_MAX_RESTARTS times.
 static inline long
 _n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
 {
-    long r = (long)syscall(SYS_poll, pfd, 1, timeout_ms);
-    return r < 0 ? -(long)errno : r;
+    long r;
+    int  restarts = 0;
+
+    do {
+        r = (long)syscall(SYS_poll, pfd, 1, timeout_ms);
+        if (r < 0) {
+            r = -(long)errno;
+        }
+    } while (r == -EINTR && restarts++ < N00B_RAW_POLL_MAX_RESTARTS);
+
+    return r;
 }
 
 [[noreturn]] static inline void
@@ -406,18 +450,14 @@ n00b_raw_exit(int code)
 
 #endif // __APPLE__ && __aarch64__
 
-/// Wait up to @p timeout_ms for @p fd to accept a write.  True when it is
-/// writable, and also when a signal cut the wait short (the Linux
-/// stop-the-world signal does, on every thread), so the caller retries.
-/// False on a timeout, an error condition, or a failed poll.
+/// Wait up to @p timeout_ms (indefinitely when negative) for @p fd to accept
+/// a write.  False on a timeout, an error condition, or a failed poll.
 static inline bool
 _n00b_raw_wait_writable(int fd, int timeout_ms)
 {
     struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
 
-    if (_n00b_raw_poll_one(&pfd, timeout_ms) == -EINTR) {
-        return true;
-    }
+    _n00b_raw_poll_one(&pfd, timeout_ms);
 
     return (pfd.revents & POLLOUT) && !(pfd.revents & (POLLERR | POLLNVAL));
 }
@@ -621,8 +661,9 @@ extern void (*n00b_raw_write_stall_hook)(int fd);
 /// one) waits for the descriptor to become writable and tries again. The
 /// rest of the buffer is dropped, not reported, when a wait times out after
 /// N00B_RAW_WRITE_STALL_MS, when poll reports an error, or once the call has
-/// waited N00B_RAW_WRITE_MAX_WAITS times, so it blocks for at most
-/// N00B_RAW_WRITE_MAX_WAITS * N00B_RAW_WRITE_STALL_MS in all.
+/// waited N00B_RAW_WRITE_MAX_WAITS times. On Linux that blocks for at most
+/// N00B_RAW_WRITE_MAX_WAITS * N00B_RAW_WRITE_STALL_MS in all; elsewhere a
+/// signal can restart a wait (see N00B_RAW_POLL_MAX_RESTARTS).
 static inline void
 n00b_raw_write_all(int fd, const void *buf, unsigned long len)
 {

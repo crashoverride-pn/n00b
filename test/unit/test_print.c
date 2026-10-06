@@ -28,6 +28,11 @@
 #include <fcntl.h>
 #include <poll.h>
 #endif
+#ifdef __linux__
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include "core/stw.h"
+#endif
 
 #include "n00b.h"
 #include "conduit/print.h"
@@ -1006,6 +1011,169 @@ test_print_fallback_waits_for_a_full_pipe(void)
 
     printf("  [PASS] print fallback waits for a full pipe\n");
 }
+
+// ============================================================================
+// 23. The fallback's wait survives collections.
+//
+// Each collection signals every thread on Linux, and the signal interrupts
+// ppoll. A helper runs one collection each time the printing thread is parked
+// in ppoll, as many times as n00b_raw_write_all may wait, then drains the
+// pipe. The line must still go out.
+// ============================================================================
+
+#ifdef __linux__
+static pid_t        stw_print_tid   = 0;
+static int          stw_drain_fd    = -1;
+static size_t       stw_filled      = 0;
+static _Atomic(int) stw_print_done  = 0;
+static _Atomic(int) stw_collections = 0;
+
+static bool
+thread_in_ppoll(pid_t tid)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/syscall", (int)tid);
+
+    int fd = open(path, O_RDONLY);
+    assert(fd >= 0);
+    char    buf[64];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) {
+        return false;
+    }
+    buf[n] = '\0';
+
+    // "running" while on a CPU; the syscall number while blocked in one.
+    char *end;
+    long  nr = strtol(buf, &end, 10);
+    return end != buf && nr == SYS_ppoll;
+}
+
+static void *
+stw_interrupter(void *arg)
+{
+    (void)arg;
+
+    for (int i = 0; i < N00B_RAW_WRITE_MAX_WAITS; i++) {
+        while (!thread_in_ppoll(stw_print_tid)) {
+            if (atomic_load(&stw_print_done)) {
+                goto drain;
+            }
+            base_nanosleep_ns(100ULL * 1000);
+        }
+        n00b_stop_the_world();
+        n00b_restart_the_world();
+        atomic_fetch_add(&stw_collections, 1);
+    }
+
+drain:;
+    char   chunk[4096];
+    size_t got = 0;
+    while (got < stw_filled) {
+        size_t  want = stw_filled - got;
+        ssize_t n    = read(stw_drain_fd, chunk,
+                            want < sizeof chunk ? want : sizeof chunk);
+        if (n > 0) {
+            got += (size_t)n;
+        }
+    }
+    return nullptr;
+}
+
+static void
+test_print_fallback_wait_survives_collections(void)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    assert(rt && rt->stdout_topic);
+
+    int fds[2];
+    assert(test_pipe_create(fds) == 0);
+    fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK);
+    fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK);
+
+    char fill[4096];
+    memset(fill, 'x', sizeof fill);
+    size_t  filled = 0;
+    ssize_t w;
+    while ((w = write(fds[1], fill, sizeof fill)) > 0) {
+        filled += (size_t)w;
+    }
+    while (write(fds[1], fill, 1) == 1) {
+        filled++;
+    }
+
+    atomic_store(&claim_held, 0);
+    atomic_store(&claim_release, 0);
+
+    auto hr = n00b_thread_spawn(stdout_claim_holder, rt->stdout_topic);
+    assert(n00b_result_is_ok(hr));
+    n00b_thread_t *holder = n00b_result_get(hr);
+    while (atomic_load(&claim_held) == 0) {
+        base_nanosleep_ns(1000ULL * 1000);
+    }
+    assert(atomic_load(&claim_held) == 1);
+
+    test_stdout_redirect_t redir = test_redirect_stdout(fds[1]);
+
+    stw_print_tid = (pid_t)syscall(SYS_gettid);
+    stw_drain_fd  = fds[0];
+    stw_filled    = filled;
+    atomic_store(&stw_print_done, 0);
+    atomic_store(&stw_collections, 0);
+
+    auto ir = n00b_thread_spawn(stw_interrupter, nullptr);
+    assert(n00b_result_is_ok(ir));
+    n00b_thread_t *interrupter = n00b_result_get(ir);
+
+    n00b_printf("collected-«#»", 503);
+    atomic_store(&stw_print_done, 1);
+
+    test_restore_stdout(&redir);
+    atomic_store(&claim_release, 1);
+    n00b_thread_join(holder);
+    n00b_thread_join(interrupter);
+
+    test_fd_close(fds[1]);
+
+    char buf[256];
+    read_pipe(fds[0], buf, 255);
+    test_fd_close(fds[0]);
+
+    int collections = atomic_load(&stw_collections);
+    if (collections != N00B_RAW_WRITE_MAX_WAITS
+        || strcmp(buf, "collected-503\n") != 0) {
+        printf("  [FAIL] collections: %d of %d, got \"%s\"\n",
+               collections, N00B_RAW_WRITE_MAX_WAITS, buf);
+        assert(false);
+    }
+
+    printf("  [PASS] print fallback wait survives collections\n");
+}
+#endif
+
+// ============================================================================
+// 24. A negative timeout waits for writability with no bound.
+// ============================================================================
+
+static void
+test_raw_wait_writable_without_timeout(void)
+{
+    int fds[2];
+    assert(test_pipe_create(fds) == 0);
+
+    bool writable = _n00b_raw_wait_writable(fds[1], -1);
+
+    test_fd_close(fds[0]);
+    test_fd_close(fds[1]);
+
+    if (!writable) {
+        printf("  [FAIL] empty pipe not writable with timeout -1\n");
+        assert(false);
+    }
+
+    printf("  [PASS] raw wait without a timeout\n");
+}
 #endif
 
 // ============================================================================
@@ -1052,6 +1220,10 @@ main(int argc, char **argv)
     test_print_timed_out_write_is_written_once();
 #ifndef _WIN32
     test_print_fallback_waits_for_a_full_pipe();
+#ifdef __linux__
+    test_print_fallback_wait_survives_collections();
+#endif
+    test_raw_wait_writable_without_timeout();
 #endif
     printf("All print tests passed.\n");
     n00b_shutdown();
