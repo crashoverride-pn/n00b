@@ -16,7 +16,12 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
+#if !defined(_WIN32)
+// mprotect/PROT_NONE, for the inline-seal case below. POSIX-only; the Windows
+// equivalent is VirtualProtect, and the arena geometry the case depends on is
+// not reproduced there, so that case is skipped on Windows (n00b#501 CI).
 #include <sys/mman.h>
+#endif
 
 #include "n00b.h"
 #include "core/arena.h"
@@ -605,6 +610,7 @@ test_close_failed_async_seal_remains_retryable(void)
 // the same hot shard, and the store has to keep working. The scratch arena
 // stands in for a caller's per-batch allocator: once its memory is PROT_NONE,
 // anything the store placed there faults on the next seal.
+#if !defined(_WIN32)
 static void
 test_close_failed_inline_seal_keeps_hot_shard_usable(void)
 {
@@ -668,6 +674,7 @@ test_close_failed_inline_seal_keeps_hot_shard_usable(void)
 
     CHECK(n00b_result_is_ok(n00b_store_close(reopened)));
 }
+#endif // !_WIN32
 
 int
 main(int argc, char *argv[])
@@ -697,7 +704,9 @@ main(int argc, char *argv[])
     test_async_seal_backlog_stats();
     test_close_drains_in_flight_async_seals();
     test_close_failed_async_seal_remains_retryable();
+#if !defined(_WIN32)
     test_close_failed_inline_seal_keeps_hot_shard_usable();
+#endif
 
     n00b_eprintf("test_rocs_async_seal OK: N=[|#|] async_shards=[|#|] "
                  "inline_shards=[|#|]\n",
