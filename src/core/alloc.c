@@ -18,6 +18,7 @@
 #include "core/thread.h"
 #include "core/epoch.h"
 #include "core/stw.h"
+#include "core/gc.h"
 
 #ifndef N00B_METADATA_START_ENTRIES
 #define N00B_METADATA_START_ENTRIES 1 << 12
@@ -121,6 +122,92 @@ n00b_new_metadata_pool(const char *creation_loc)
                              // migration retires their stores lock-free from
                              // any thread — an inline drain always races.
                              .__is_md_pool = true);
+}
+
+#if defined(N00B_DEBUG)
+// Debug-build work counter: finalizer registry entries a bare n00b_free
+// examined looking for its object's finalizer.
+_Atomic uint64_t n00b_finalizer_registry_probes = 0;
+#endif
+
+// rt->finalizers is mutated only under the critical_execution read gate, so a
+// collection, which takes the write side before it suspends anyone, never sees
+// it mid-update. Callers already running with the world stopped skip the gate.
+static inline bool
+n00b_finalizer_gate_lock(n00b_runtime_t *rt)
+{
+    if (!rt->critical_execution.inited || n00b_atomic_load(&rt->stw_active)) {
+        return false;
+    }
+    n00b_rw_read_lock(&rt->critical_execution);
+    return true;
+}
+
+void
+n00b_finalizer_index_init(n00b_runtime_t *rt)
+{
+    rt->finalizer_pool = n00b_new_metadata_pool(N00B_LOC_STRING());
+    rt->finalizers     = n00b_alloc_with_opts(
+        _n00b_dict_internal_t,
+        &(n00b_alloc_opts_t){.allocator = rt->finalizer_pool});
+    _n00b_dict_internal_init(rt->finalizers,
+                             N00B_MD_KSZ,
+                             N00B_MD_VSZ,
+                             typehash(void *),
+                             typehash(n00b_finalizer_info_t *),
+                             .allocator     = rt->finalizer_pool,
+                             .hash          = n00b_hash_word,
+                             .skip_obj_hash = true,
+                             .scan_kind     = N00B_GC_SCAN_KIND_NONE);
+    n00b_atomic_store(&rt->finalizer_count, 0);
+}
+
+// Removes and returns the index entry for `key`. Caller holds the gate.
+static n00b_finalizer_info_t *
+n00b_finalizer_index_take(n00b_runtime_t *rt, void *key)
+{
+    bool                   found = false;
+    n00b_finalizer_info_t *info  = nullptr;
+    void                  *slot  = _n00b_dict_internal_get(rt->finalizers,
+                                                     N00B_MD_KSZ,
+                                                     N00B_MD_VSZ,
+                                                     &key,
+                                                     &info,
+                                                     &found);
+    if (slot == nullptr || !found) {
+        return nullptr;
+    }
+    info = *(n00b_finalizer_info_t **)slot;
+    (void)_n00b_dict_internal_remove(rt->finalizers, N00B_MD_KSZ, N00B_MD_VSZ, &key);
+    atomic_fetch_sub_explicit(&rt->finalizer_count, 1, memory_order_acq_rel);
+    return info;
+}
+
+// Attaches fn(user) to `obj` in the index, replacing any finalizer it had.
+static void
+n00b_finalizer_index_put(n00b_runtime_t *rt, void *obj, n00b_finalizer_t fn, void *user)
+{
+    n00b_allocator_t      *sp   = (n00b_allocator_t *)&rt->system_pool;
+    n00b_finalizer_info_t *info = n00b_alloc_with_opts(n00b_finalizer_info_t,
+                                                       &(n00b_alloc_opts_t){.allocator = sp});
+
+    bool                   gate = n00b_finalizer_gate_lock(rt);
+    n00b_finalizer_info_t *old  = n00b_finalizer_index_take(rt, obj);
+
+    *info = (n00b_finalizer_info_t){
+        .funcptr  = fn,
+        .key      = obj,
+        .user_ptr = user,
+    };
+    (void)_n00b_dict_internal_put(rt->finalizers, N00B_MD_KSZ, N00B_MD_VSZ, &obj, &info);
+    n00b_atomic_add(&rt->finalizer_count, 1);
+    if (gate) {
+        n00b_rw_unlock(&rt->critical_execution);
+    }
+
+    if (old != nullptr) {
+        n00b_free(old, .allocator = sp);
+    }
 }
 
 static uint32_t
@@ -554,9 +641,14 @@ _n00b_alloc_raw(size_t             n,
             .file_name       = location,
             .gc_epoch        = epoch_now,
             .alive           = 1,
+            .finalizer       = opts->finalizer,
+            .finalizer_user  = opts->finalizer_data,
         };
 
         n00b_md_put(opts->allocator->metadata, r, map_item);
+        if (opts->finalizer) {
+            n00b_atomic_store(&opts->allocator->oob_finalizers, true);
+        }
         assert(n00b_md_get(opts->allocator->metadata, r) == map_item);
         if (md_stw) {
             n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
@@ -568,8 +660,9 @@ _n00b_alloc_raw(size_t             n,
     // collector can discover the object normally from here on, so its page no
     // longer needs the pin-pre-pass safety net (see n00b_arena_alloc + the pin
     // pre-pass).  Cheap relaxed store; the matching publish was in n00b_arena_alloc.
+    n00b_thread_t *self_for_finalizers = n00b_thread_self();
     {
-        n00b_thread_t *_self = n00b_thread_self();
+        n00b_thread_t *_self = self_for_finalizers;
         if (_self != nullptr
             && n00b_atomic_load(&_self->gc_inflight_len) != 0) {
             // Mirror image of the publish in n00b_arena_alloc: `start` is the
@@ -647,33 +740,20 @@ _n00b_alloc_raw(size_t             n,
         }
     }
 
-    if (opts->finalizer) {
+    // An OOB record was armed with the finalizer above, under the metadata
+    // gate. Anything else goes in the runtime index.
+    if (opts->finalizer && opts->allocator->metadata_pool == nullptr) {
         n00b_runtime_t *rt = n00b_get_runtime();
-        if (rt) {
-            // Prefer the OOB record when this pool has one
-            // (external_metadata = true). The inline header is
-            // intentionally not used for finalizer storage — see
-            // n00b_add_finalizer for the rationale.
-            n00b_oob_hdr_t *meta_oob =
-                (opts->allocator->metadata_pool != nullptr) ? map_item : nullptr;
-
-            if (meta_oob != nullptr) {
-                meta_oob->finalizer      = opts->finalizer;
-                meta_oob->finalizer_user = opts->finalizer_data;
-            }
-            else {
-                n00b_alloc_opts_t     md_opts = {.allocator = (n00b_allocator_t *)&rt->system_pool};
-                n00b_finalizer_info_t *info  = n00b_alloc_with_opts(n00b_finalizer_info_t, &md_opts);
-
-                *info = (n00b_finalizer_info_t){
-                    .funcptr    = opts->finalizer,
-                    .key        = r,
-                    .alloc_info = nullptr,
-                    .user_ptr   = opts->finalizer_data,
-                };
-                n00b_list_push(rt->finalizers, info);
-            }
+        if (rt && rt->finalizers) {
+            n00b_finalizer_index_put(rt, r, opts->finalizer, opts->finalizer_data);
         }
+    }
+
+    // This allocation's own out-of-memory collect queued finalizers; the
+    // object is fully registered now, so run them before returning.
+    if (self_for_finalizers != nullptr && self_for_finalizers->gc_run_finalizers) {
+        self_for_finalizers->gc_run_finalizers = false;
+        n00b_gc_run_finalizers();
     }
 
     return r;
@@ -1134,42 +1214,31 @@ n00b_add_finalizer(void *obj, n00b_finalizer_t fn, void *user_data)
     n00b_runtime_t *rt = n00b_get_runtime();
     assert(rt);
 
-    // Primary storage: write the finalizer directly into the
-    // allocation's out-of-band record (when one exists). The OOB
-    // record is the authoritative dynamic metadata and not on the
-    // marshal path, so it's the safe place to attach runtime state
-    // like this. n00b_run_and_remove_finalizers does a single
-    // pointer dereference to read it back — O(1), no global walk.
-    //
-    // Inline-only allocations deliberately stay on the fallback
-    // path; the inline header doubles as the marshal payload and
-    // must stay tight.
-    bool            unlock_gate = false;
-    n00b_oob_hdr_t *oob         = n00b_oob_for_user_ptr_held(obj, &unlock_gate);
-    if (oob != nullptr) {
-        oob->finalizer      = fn;
-        oob->finalizer_user = user_data;
-        n00b_metadata_gate_unlock(unlock_gate);
-        return;
+    // Allocations with an OOB record keep the finalizer there, so the free
+    // path reads it back with the record lookup it already does. The inline
+    // header stays out of it: it doubles as the marshal payload.
+    n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(obj);
+    if (n00b_option_is_set(alloc_opt)) {
+        n00b_allocator_t *al = n00b_option_get(alloc_opt);
+        if (al != nullptr && al->metadata != nullptr) {
+            bool unlock_gate = n00b_allocator_metadata_needs_stw_gate(al);
+            if (unlock_gate) {
+                n00b_rw_read_lock(&rt->critical_execution);
+            }
+            n00b_oob_hdr_t *oob = n00b_md_get(al->metadata, obj);
+            if (oob != nullptr) {
+                oob->finalizer      = fn;
+                oob->finalizer_user = user_data;
+                n00b_atomic_store(&al->oob_finalizers, true);
+            }
+            n00b_metadata_gate_unlock(unlock_gate);
+            if (oob != nullptr) {
+                return;
+            }
+        }
     }
-    n00b_metadata_gate_unlock(unlock_gate);
 
-    // Fallback: allocations from pools without metadata records
-    // (e.g. the hidden system_pool, which is intentionally minimal)
-    // register in the global list keyed on the user pointer. Slower
-    // O(N) lookup, but rare — system_pool allocations are GC infra,
-    // not application data.
-    n00b_allocator_t      *sp   = (n00b_allocator_t *)&rt->system_pool;
-    n00b_finalizer_info_t *info = n00b_alloc_with_opts(n00b_finalizer_info_t, &(n00b_alloc_opts_t){.allocator = sp});
-
-    *info = (n00b_finalizer_info_t){
-        .funcptr    = fn,
-        .key        = obj,
-        .alloc_info = nullptr,
-        .user_ptr   = user_data,
-    };
-
-    n00b_list_push(rt->finalizers, info);
+    n00b_finalizer_index_put(rt, obj, fn, user_data);
 }
 
 static void
@@ -1188,8 +1257,8 @@ n00b_run_and_remove_finalizers(void *ptr)
     // out-of-band record. Clear the slot before invoking so a
     // finalizer that frees other memory cannot trigger a recursive
     // run against the same allocation. OOB-bearing allocations
-    // cannot ALSO have a global list entry (n00b_add_finalizer
-    // chooses one path or the other), so this path is complete.
+    // never have an index entry (n00b_add_finalizer chooses one
+    // or the other), so this path is complete.
     {
         bool            unlock_gate = false;
         n00b_oob_hdr_t *oob         = n00b_oob_for_user_ptr_held(ptr, &unlock_gate);
@@ -1207,23 +1276,20 @@ n00b_run_and_remove_finalizers(void *ptr)
         n00b_metadata_gate_unlock(unlock_gate);
     }
 
-    // Fallback: walk the global list for allocations from pools
-    // without metadata records (system_pool). Match by user pointer.
-    if (!rt->finalizers.data) {
-        goto type_cleanup;
-    }
-    {
-        // Walk backwards for safe removal via n00b_list_delete.
-        size_t len = n00b_list_len(rt->finalizers);
-
-        for (size_t i = len; i > 0; i--) {
-            n00b_finalizer_info_t *entry = n00b_list_get(rt->finalizers, i - 1);
-
-            if (entry->key == ptr) {
-                entry->funcptr(entry->user_ptr);
-                (void)n00b_list_delete(rt->finalizers, i - 1);
-                n00b_free(entry);
-            }
+    if (rt->finalizers != nullptr && n00b_atomic_load(&rt->finalizer_count) != 0) {
+        bool                   gate = n00b_finalizer_gate_lock(rt);
+        n00b_finalizer_info_t *info = n00b_finalizer_index_take(rt, ptr);
+        if (gate) {
+            n00b_rw_unlock(&rt->critical_execution);
+        }
+#if defined(N00B_DEBUG)
+        atomic_fetch_add_explicit(&n00b_finalizer_registry_probes, 1, memory_order_relaxed);
+#endif
+        if (info != nullptr) {
+            n00b_finalizer_t fn   = info->funcptr;
+            void            *user = info->user_ptr;
+            n00b_free(info, .allocator = (n00b_allocator_t *)&rt->system_pool);
+            fn(user);
         }
     }
 

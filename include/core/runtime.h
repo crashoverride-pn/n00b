@@ -102,14 +102,24 @@ struct n00b_runtime_t {
      * record / lock-chain scan in gc.c all valid. */
     n00b_pool_t                 runtime_obj_pool;
     n00b_list_t(n00b_gc_root_t) gc_roots; // User-registered GC roots.
-    /* Legacy fallback registry kept for callers that attach a
-     * finalizer to an allocation from a pool without per-alloc
-     * metadata. The OOB-backed fast path (the finalizer slot on
-     * n00b_oob_hdr_t) is the preferred one — callers that need
-     * finalizers MUST allocate from a metadata-bearing pool.
-     * This list grows under the legacy path and is O(N) walked
-     * on n00b_free, so it must stay small. */
-    n00b_list_t(n00b_finalizer_info_t *) finalizers;
+    /* Finalizers attached to allocations with no OOB record (arenas in
+     * release builds, inline-header pools, the system pool): a dict from the
+     * user pointer to its n00b_finalizer_info_t *, backed by finalizer_pool.
+     * Mutators touch it only under the critical_execution read gate, so a
+     * collector, which holds the write side, always finds it quiescent and
+     * re-keys moved objects in place. finalizer_count is its size, read
+     * without the gate so a free with nothing registered skips the lookup. */
+    _n00b_dict_internal_t   *finalizers;
+    n00b_allocator_t        *finalizer_pool;
+    _Atomic uint64_t         finalizer_count;
+    /* Finalizers of objects a collection found unreachable. The collector
+     * appends under STW and treats every entry's user_ptr as a root, so the
+     * object and what it references survive until the finalizer has run;
+     * n00b_gc_run_finalizers pops them after the world restarts. */
+    n00b_finalizer_info_t   *pending_finalizers;
+    uint32_t                 pending_finalizers_cap;
+    _Atomic uint32_t         pending_finalizers_len;
+    _Atomic bool             finalizer_drain_active;
     /* Every pool created with @c external_metadata=true registers
      * itself here so the GC mark phase can iterate its metadata dict
      * directly. Each metadata-bearing alloc with @c alive set is a

@@ -196,8 +196,7 @@ _kargs {
         return NULL;
     }
 
-    n00b_cf_labels_t *labels = n00b_alloc(n00b_cf_labels_t);
-    n00b_dict_init(labels, .hash = n00b_hash_word, .skip_obj_hash = true);
+    n00b_cf_labels_t *labels = n00b_cf_labels_new();
 
     // Canonical idiom: build the list as a fully scan-info-threaded
     // lvalue, then struct-copy into the heap-allocated return shell.
@@ -207,8 +206,7 @@ _kargs {
         n00b_alloc(n00b_list_t(n00b_sym_entry_t *));
     *params = params_lst;
 
-    n00b_node_types_t *node_types = n00b_alloc(n00b_node_types_t);
-    n00b_dict_init(node_types, .hash = n00b_hash_word, .skip_obj_hash = true);
+    n00b_node_types_t *node_types = n00b_node_types_new();
 
     n00b_list_t(n00b_sym_entry_t *) shadowed_lst =
         n00b_list_new_private(n00b_sym_entry_t *);

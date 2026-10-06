@@ -295,17 +295,8 @@ n00b_quic_endpoint_new(n00b_conduit_t            *c,
     n00b_allocator_t *alloc =
         (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
-    /* Forward decl — we want to register a finalizer that calls
-     * the close path so GC reclaims the UDP fd + picoquic context
-     * if the user drops the handle without explicit close.  The
-     * finalizer is idempotent against `n00b_quic_endpoint_close`. */
-    extern void _n00b_quic_endpoint_finalize(void *p);
-
     n00b_quic_endpoint_t *ep = n00b_alloc_with_opts(n00b_quic_endpoint_t,
-                                  &(n00b_alloc_opts_t){
-                                      .allocator      = alloc,
-                                      .finalizer      = _n00b_quic_endpoint_finalize,
-                                  });
+                                  &(n00b_alloc_opts_t){.allocator = alloc});
 
     /* Per-endpoint mutex serializing all picoquic mutations
      * (run_once, chan_open / send / reset / stop_sending / close,
@@ -837,13 +828,6 @@ n00b_quic_endpoint_run_once(n00b_quic_endpoint_t *ep, int timeout_ms)
  * Stats accessor
  * =========================================================================== */
 
-/* GC-time finalizer.  Idempotent against `n00b_quic_endpoint_close`. */
-void
-_n00b_quic_endpoint_finalize(void *p)
-{
-    n00b_quic_endpoint_close((n00b_quic_endpoint_t *)p);
-}
-
 /* Test-only accessor: returns the underlying picoquic_quic_t.  Public
  * code should never reach into picoquic directly through the endpoint;
  * this exists so that tests in `test/unit/test_quic_*.c` can configure
@@ -1077,8 +1061,7 @@ n00b_quic_endpoint_close(n00b_quic_endpoint_t *ep)
      * calls while this freed ep->quic underneath it.  Holding the lock here
      * makes close wait for any in-flight iteration to finish, and the
      * re-check run_once does after acquiring the lock makes the next one
-     * bail.  Under stop-the-world (the GC finalizer path) the lock is a
-     * no-op by design, and no other thread is running. */
+     * bail. */
     n00b_data_write_lock(ep->lock);
     if (ep->closed) {
         n00b_data_unlock(ep->lock);

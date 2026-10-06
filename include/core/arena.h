@@ -62,6 +62,13 @@ struct n00b_arena_t {
     _Atomic(n00b_segment_t *) current_segment;
     _Atomic uint32_t          mutex;
     _Atomic uint32_t          alloc_count;
+    // The metadata dict's insertion_epoch when alloc_count was last zeroed.
+    // Each allocation inserts one record, so debug collections check that the
+    // two have advanced together. A reset leaves records that later
+    // allocations overwrite rather than insert, so it turns the check off
+    // until the next collection.
+    uint32_t                  md_inserts_at_zero;
+    bool                      md_inserts_unknown;
     // If collection_enabled is off, when a heap / arena runs out of
     // memory, we just tack on a new segment of at least the same size
     // as the prior one.
@@ -170,6 +177,37 @@ extern _Atomic uint64_t n00b_arena_segment_shrink_retries;
  */
 extern void (*n00b_arena_segment_publish_hook)(n00b_arena_t *arena);
 
+/**
+ * Bytes of the default arena a thread reserves at a time for its allocation
+ * buffer, and the largest request served from one. Larger requests take the
+ * shared bump.
+ */
+#define N00B_TLAB_SIZE       (32 * 1024)
+#define N00B_TLAB_MAX_OBJECT (4 * 1024)
+
+/** @brief Add an exiting thread's buffered allocation count to its arena. */
+extern void n00b_arena_tlab_thread_exit(n00b_thread_t *t);
+
+#if defined(N00B_DEBUG)
+/**
+ * @brief Test-only hook in the buffered allocation path.
+ *
+ * Called after a thread reads its buffer and before it publishes the in-flight
+ * reservation, so a test can hold it in the window where a collection may
+ * retire the buffer. Null outside tests.
+ */
+extern void (*n00b_arena_tlab_publish_hook)(void);
+
+/**
+ * Debug-build work counters for the arena allocation path: commits of the
+ * shared bump pointer (one per object outside a thread buffer, one per buffer
+ * refill), and critical_execution acquisitions made to record an
+ * allocation's extent.
+ */
+extern _Atomic uint64_t n00b_arena_shared_bumps;
+extern _Atomic uint64_t n00b_arena_extent_gates;
+#endif
+
 
 /**
  * @brief Register a finalizer to run when @p obj is collected or freed.
@@ -178,23 +216,23 @@ extern void (*n00b_arena_segment_publish_hook)(n00b_arena_t *arena);
  *                  the registry keys on @p obj directly, so allocators
  *                  without alloc metadata (e.g. the hidden system pool)
  *                  participate just as well as GC-tracked arenas.
- * @param fn        Finalizer callback.
- * @param user_data Opaque pointer passed to @p fn when invoked.
+ * @param fn        Finalizer callback. Replaces any finalizer @p obj had.
+ * @param user_data Opaque pointer passed to @p fn when invoked. The collector
+ *                  treats it as a reference held by @p obj, and updates it
+ *                  when its target moves.
+ *
+ * A collection that finds @p obj unreachable keeps it alive and queues @p fn;
+ * see n00b_gc_run_finalizers for when the queue runs.
  */
 extern void n00b_add_finalizer(void *obj, n00b_finalizer_t fn, void *user_data);
 
+/** @brief Create the runtime's finalizer index (rt->finalizers). Init only. */
+extern void n00b_finalizer_index_init(n00b_runtime_t *rt);
+
 struct n00b_finalizer_info_t {
-    n00b_finalizer_t   funcptr;
-    void              *key;        // User pointer; primary lookup key
-                                   // for n00b_free-driven release.
-    n00b_inline_hdr_t *alloc_info; // GC tracking key for forwarding
-                                   // during collection. Null when the
-                                   // owning allocator has no alloc
-                                   // metadata (e.g. system_pool); such
-                                   // entries are never in any GC-
-                                   // managed arena, so the GC sweep
-                                   // skips them.
-    void              *user_ptr;
+    n00b_finalizer_t funcptr;
+    void            *key;      // User pointer the finalizer is attached to.
+    void            *user_ptr; // Argument passed to funcptr.
 };
 
 #define n00b_new_arena(...)                                                                    \

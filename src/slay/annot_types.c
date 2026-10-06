@@ -35,7 +35,7 @@ annot_phase_types_post(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
                 ctx->translate_type_spec, a->infer_expr);
 
             if (t) {
-                uintptr_t key = (uintptr_t)nc->node;
+                n00b_parse_tree_t *key = nc->node;
                 n00b_dict_put(ctx->node_types, key, t);
             }
 
@@ -52,7 +52,7 @@ annot_phase_types_post(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
         bool already_typed = false;
         {
             bool      found = false;
-            uintptr_t key   = (uintptr_t)nc->node;
+            n00b_parse_tree_t *key = nc->node;
             (void)n00b_dict_get(ctx->node_types, key, &found);
             already_typed = found;
         }
@@ -69,10 +69,9 @@ annot_phase_types_post(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
                     n00b_nt_node_t *cpn = &n00b_tree_node_value(child);
 
                     if (!cpn->group_top) {
-                        bool      found = false;
-                        uintptr_t ck    = (uintptr_t)child;
+                        bool found = false;
                         n00b_tc_type_t *ct
-                            = n00b_dict_get(ctx->node_types, ck, &found);
+                            = n00b_dict_get(ctx->node_types, child, &found);
 
                         if (found) {
                             sole_child_type = ct;
@@ -84,7 +83,7 @@ annot_phase_types_post(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
             }
 
             if (nt_child_count == 1 && sole_child_type) {
-                uintptr_t key = (uintptr_t)nc->node;
+                n00b_parse_tree_t *key = nc->node;
                 n00b_dict_put(ctx->node_types, key, sole_child_type);
             }
         }
@@ -97,7 +96,7 @@ annot_phase_types_post(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
 
     if (nc->last_sym && nc->last_sym->type_var) {
         bool      found = false;
-        uintptr_t key   = (uintptr_t)nc->node;
+        n00b_parse_tree_t *key = nc->node;
         n00b_tc_type_t *node_type
             = n00b_dict_get(ctx->node_types, key, &found);
 
@@ -268,9 +267,8 @@ annot_phase_types_post(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
 
             // Regular NT child — an argument expression.
             bool           afound = false;
-            uintptr_t      ak     = (uintptr_t)child;
             n00b_tc_type_t *arg_type
-                = n00b_dict_get(ctx->node_types, ak, &afound);
+                = n00b_dict_get(ctx->node_types, child, &afound);
 
             if (afound && arg_type && arg_ix < n_params) {
                 n00b_tc_type_t *param_type

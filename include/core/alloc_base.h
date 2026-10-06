@@ -54,6 +54,10 @@ struct n00b_base_allocator_t {
     // its owning create-site. MUST match the trailing field in n00b_allocator_t
     // (the two share a layout prefix and are cast to each other).
     const char               *creation_loc;
+    // Set once any OOB record of this allocator has carried a finalizer, so a
+    // collection walks the from-space metadata for unreachable finalizable
+    // objects only when there can be some. MUST match n00b_allocator_t.
+    _Atomic bool              oob_finalizers;
 };
 
 // ============================================================================

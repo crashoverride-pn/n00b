@@ -38,6 +38,8 @@ struct n00b_allocator_t {
     // "file:line" of the create-site. MUST mirror n00b_base_allocator_t (these
     // two structs share a layout prefix and are cast to each other).
     const char               *creation_loc;
+    // MUST mirror n00b_base_allocator_t.oob_finalizers.
+    _Atomic bool              oob_finalizers;
     void                     *opaque[];
 };
 

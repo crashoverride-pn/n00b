@@ -258,8 +258,6 @@ _n00b_quic_conn_register_chan(n00b_quic_conn_t *conn, n00b_quic_chan_t *chan)
  * handle.
  * =========================================================================== */
 
-extern void _n00b_quic_chan_finalize(void *p);
-
 n00b_quic_chan_t *
 _n00b_quic_conn_dgram_chan(n00b_quic_conn_t *conn)
 {
@@ -275,10 +273,7 @@ _n00b_quic_conn_dgram_chan(n00b_quic_conn_t *conn)
 
     n00b_quic_chan_t *chan = n00b_alloc_with_opts(
         n00b_quic_chan_t,
-        &(n00b_alloc_opts_t){
-            .allocator = alloc,
-            .finalizer = _n00b_quic_chan_finalize,
-        });
+        &(n00b_alloc_opts_t){.allocator = alloc});
 
     chan->conn             = conn;
     chan->next_in_conn     = nullptr;
@@ -341,13 +336,8 @@ n00b_quic_connect(n00b_quic_endpoint_t  *ep,
     n00b_allocator_t *alloc =
         (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
-    extern void _n00b_quic_conn_finalize(void *p);
-
     n00b_quic_conn_t *conn = n00b_alloc_with_opts(n00b_quic_conn_t,
-                                &(n00b_alloc_opts_t){
-                                    .allocator = alloc,
-                                    .finalizer = _n00b_quic_conn_finalize,
-                                });
+                                &(n00b_alloc_opts_t){.allocator = alloc});
 
     conn->endpoint    = ep;
     conn->client_mode = true;
@@ -648,28 +638,6 @@ n00b_quic_conn_peer_addr(n00b_quic_conn_t        *conn,
     return true;
 }
 
-/* GC-time finalizer.  If the user dropped the conn handle without
- * calling `n00b_quic_close`, send a CONNECTION_CLOSE with code 0 and
- * mark closed.  Idempotent.  Safe even if the owning endpoint has
- * already been finalized: we check `endpoint->closed` and `cnx`
- * before touching picoquic — picoquic_free on the endpoint frees
- * the cnx, but our cnx pointer was zeroed by `n00b_quic_close`'s
- * own teardown path or by the endpoint close. */
-void
-_n00b_quic_conn_finalize(void *p)
-{
-    n00b_quic_conn_t *conn = (n00b_quic_conn_t *)p;
-    if (!conn || conn->closed) return;
-    if (conn->endpoint && conn->endpoint->closed) {
-        /* Endpoint already gone — nothing safe to do at the picoquic
-         * level; just mark closed. */
-        conn->cnx    = nullptr;
-        conn->closed = true;
-        return;
-    }
-    n00b_quic_close(conn, 0);
-}
-
 /* ===========================================================================
  * Server-side accept (internal): wrap a picoquic-created cnx as ours.
  * =========================================================================== */
@@ -686,10 +654,7 @@ _n00b_quic_conn_accept_internal(n00b_quic_endpoint_t *ep, picoquic_cnx_t *cnx)
         (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
     n00b_quic_conn_t *conn = n00b_alloc_with_opts(n00b_quic_conn_t,
-                                &(n00b_alloc_opts_t){
-                                    .allocator = alloc,
-                                    .finalizer = _n00b_quic_conn_finalize,
-                                });
+                                &(n00b_alloc_opts_t){.allocator = alloc});
 
     conn->endpoint         = ep;
     conn->cnx              = cnx;

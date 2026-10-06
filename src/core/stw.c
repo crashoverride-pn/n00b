@@ -74,6 +74,81 @@ extern bool n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *re
 #endif
 
 #if defined(__linux__)
+// Appends `bytes` of saved register state at `src` to the thread's vector
+// register words, up to N00B_GC_VREG_WORDS. A plain loop: signal context.
+static uint32_t
+n00b_stw_copy_vreg_words(uint64_t *out, uint32_t n, const uint8_t *src, uint64_t bytes)
+{
+    const uint64_t *w = (const uint64_t *)src;
+    for (uint64_t i = 0; i < bytes / 8 && n < N00B_GC_VREG_WORDS; i++) {
+        out[n++] = w[i];
+    }
+    return n;
+}
+
+#if defined(__aarch64__)
+// Record magics from the kernel's arm64 sigcontext (asm/sigcontext.h, which
+// clashes with glibc's signal.h).
+#define N00B_SIG_FPSIMD_MAGIC 0x46508001u
+#define N00B_SIG_SVE_MAGIC    0x53564501u
+
+// The interrupted thread's v0-v31 (and z0-z31 when SVE state is live), from
+// the records in the signal frame's __reserved area.
+static uint32_t
+n00b_stw_capture_vregs(ucontext_t *uc, uint64_t *out)
+{
+    const uint8_t *p   = (const uint8_t *)uc->uc_mcontext.__reserved;
+    const uint8_t *end = p + sizeof(uc->uc_mcontext.__reserved);
+    uint32_t       n   = 0;
+
+    while (p + 8 <= end) {
+        uint32_t magic = ((const uint32_t *)p)[0];
+        uint32_t size  = ((const uint32_t *)p)[1];
+        if (magic == 0 || size < 8 || size > (uint64_t)(end - p)) {
+            break;
+        }
+        // fpsimd_context: 8-byte header, fpsr, fpcr, then vregs[32].
+        if (magic == N00B_SIG_FPSIMD_MAGIC && size >= 16 + 32 * 16) {
+            n = n00b_stw_copy_vreg_words(out, n, p + 16, 32 * 16);
+        }
+        // sve_context: 16-byte header with vl at offset 8; with register
+        // data present, z0-z31 (vl bytes each) start at offset 16.
+        else if (magic == N00B_SIG_SVE_MAGIC && size > 16) {
+            uint64_t vl    = *(const uint16_t *)(p + 8);
+            uint64_t bytes = 32 * vl;
+            if (bytes > size - 16) {
+                bytes = size - 16;
+            }
+            n = n00b_stw_copy_vreg_words(out, n, p + 16, bytes);
+        }
+        p += size;
+    }
+    return n;
+}
+#elif defined(__x86_64__)
+// The interrupted thread's xmm0-15 from the fxsave image, then the XSAVE
+// extended state (ymm, zmm) that follows it when the kernel saved one.
+static uint32_t
+n00b_stw_capture_vregs(ucontext_t *uc, uint64_t *out)
+{
+    const uint8_t *fp = (const uint8_t *)uc->uc_mcontext.fpregs;
+    if (fp == nullptr) {
+        return 0;
+    }
+
+    uint32_t n = n00b_stw_copy_vreg_words(out, 0, fp + 160, 16 * 16);
+
+    // struct _fpx_sw_bytes lives in fxsave's software-reserved bytes at 464:
+    // magic1, extended_size, xfeatures, xstate_size.
+    const uint32_t *sw = (const uint32_t *)(fp + 464);
+    if (sw[0] == 0x46505853u && sw[4] > 576) {
+        // Past the 512-byte legacy area and the 64-byte XSAVE header.
+        n = n00b_stw_copy_vreg_words(out, n, fp + 576, sw[4] - 576);
+    }
+    return n;
+}
+#endif
+
 // WP-4 (D-040) Linux suspend-signal handler.  Runs IN SIGNAL CONTEXT on the
 // TARGET thread (delivered by the STW initiator via tgkill), on the target's
 // NORMAL stack (not an altstack).  The `_n00b_thread_` prefix intentionally
@@ -124,6 +199,7 @@ _n00b_thread_stw_suspend_handler(int sig, siginfo_t *si, void *uctx)
 #else
 #error "WP-4 Linux suspend handler: add ucontext register capture for this arch"
 #endif
+    self->gc_captured_vreg_words = n00b_stw_capture_vregs(uc, self->gc_captured_vregs);
 
     n00b_barrier();
     n00b_atomic_store(&self->gc_preempt_suspended, true);
@@ -214,6 +290,23 @@ _n00b_preempt_suspend_capture(n00b_thread_t *t)
     }
     t->gc_captured_regs[29] = st.__fp;
     t->gc_captured_regs[30] = st.__lr;
+
+    // v0-v31: a vectorized copy can hold a heap pointer in these alone.
+    arm_neon_state64_t     nst;
+    mach_msg_type_number_t ncount = ARM_NEON_STATE64_COUNT;
+    if (thread_get_state(port,
+                         ARM_NEON_STATE64,
+                         (thread_state_t)&nst,
+                         &ncount)
+        != KERN_SUCCESS) {
+        (void)thread_resume(port);
+        return false;
+    }
+    for (int i = 0; i < 32; i++) {
+        t->gc_captured_vregs[2 * i]     = (uint64_t)nst.__v[i];
+        t->gc_captured_vregs[2 * i + 1] = (uint64_t)(nst.__v[i] >> 64);
+    }
+    t->gc_captured_vreg_words = 64;
     n00b_atomic_store(&t->gc_preempt_suspended, true);
     return true;
 #elif defined(__linux__)
@@ -263,7 +356,7 @@ _n00b_preempt_suspend_capture(n00b_thread_t *t)
         return false;
     }
     CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT;
     if (!GetThreadContext(h, &ctx)) {
         ResumeThread(h);
         CloseHandle(h);
@@ -277,9 +370,19 @@ _n00b_preempt_suspend_capture(n00b_thread_t *t)
     for (int i = 0; i < 15; i++) {
         t->gc_captured_regs[i] = gp[i];
     }
+    for (int i = 0; i < 16; i++) {
+        t->gc_captured_vregs[2 * i]     = ctx.FltSave.XmmRegisters[i].Low;
+        t->gc_captured_vregs[2 * i + 1] = (uint64_t)ctx.FltSave.XmmRegisters[i].High;
+    }
+    t->gc_captured_vreg_words = 32;
 #elif defined(_M_ARM64) || defined(__aarch64__)
     t->stack_top = (void *)(uintptr_t)ctx.Sp;
     n00b_arm64_context_gprs(&ctx, t->gc_captured_regs);
+    for (int i = 0; i < 32; i++) {
+        t->gc_captured_vregs[2 * i]     = ctx.V[i].Low;
+        t->gc_captured_vregs[2 * i + 1] = (uint64_t)ctx.V[i].High;
+    }
+    t->gc_captured_vreg_words = 64;
 #else
 #error "WP-4 Windows suspend: add CONTEXT register capture for this arch"
 #endif
@@ -300,11 +403,12 @@ _n00b_preempt_resume(n00b_thread_t *t)
 #if defined(__APPLE__) && defined(__aarch64__)
     if (n00b_atomic_load(&t->gc_preempt_suspended)) {
         n00b_atomic_store(&t->gc_preempt_suspended, false);
-        // Zero the captured register file so a later collection's whole-struct
+        // Zero the captured register files so a later collection's whole-struct
         // conservative scan does not re-root stale register values.
         for (int i = 0; i < 31; i++) {
             t->gc_captured_regs[i] = 0;
         }
+        t->gc_captured_vreg_words = 0;
         (void)thread_resume((mach_port_t)t->os_thread_port);
     }
 #elif defined(__linux__)
@@ -318,6 +422,7 @@ _n00b_preempt_resume(n00b_thread_t *t)
         for (int i = 0; i < 31; i++) {
             t->gc_captured_regs[i] = 0;
         }
+        t->gc_captured_vreg_words = 0;
         n00b_barrier();
         n00b_atomic_store(&t->gc_preempt_suspended, false);
     }
@@ -329,6 +434,7 @@ _n00b_preempt_resume(n00b_thread_t *t)
         for (int i = 0; i < 31; i++) {
             t->gc_captured_regs[i] = 0;
         }
+        t->gc_captured_vreg_words = 0;
         HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, (DWORD)t->os_tid);
         if (h != nullptr) {
             ResumeThread(h);

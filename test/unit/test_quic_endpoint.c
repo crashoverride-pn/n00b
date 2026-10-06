@@ -13,6 +13,7 @@
 #include "net/quic/quic_types.h"
 #include "net/quic/endpoint.h"
 #include "net/quic/conn.h"
+#include "net/quic/chan.h"
 #include "net/quic/lb_cid.h"
 #include "internal/net/quic/endpoint_internal.h"
 #include "picoquic.h"
@@ -333,6 +334,70 @@ test_conn_remote_cid_null_safety(void)
     printf("  [PASS] n00b_quic_conn_remote_cid NULL-safe\n");
 }
 
+/* ============================================================================
+ * 8. Endpoint, conn, and channel handles add nothing to the finalizer index.
+ *
+ * They live in conduit_pool, which the collector does not reclaim per
+ * object, and are released by their close calls. A finalizer registered on
+ * one could never run, and its index entry would outlive the handle.
+ * ============================================================================ */
+
+static void
+test_handles_leave_no_finalizer_entries(void)
+{
+    n00b_runtime_t *rt     = n00b_get_runtime();
+    uint64_t        before = n00b_atomic_load(&rt->finalizer_count);
+
+    auto cr = n00b_conduit_new();
+    assert(n00b_result_is_ok(cr));
+    n00b_conduit_t *c  = n00b_result_get(cr);
+    auto            ir = n00b_conduit_io_new_default(c);
+    assert(n00b_result_is_ok(ir));
+    n00b_conduit_io_backend_t *io = n00b_result_get(ir);
+
+    auto er = n00b_quic_endpoint_new(c, io,
+                                     .bind_host = "127.0.0.1",
+                                     .alpn      = "n00b-echo/1");
+    if (n00b_result_is_err(er)) {
+        printf("  [SKIP] finalizer entries (bind failed: %d)\n",
+               n00b_result_get_err(er));
+        n00b_conduit_io_destroy(io);
+        n00b_conduit_destroy(c);
+        return;
+    }
+    n00b_quic_endpoint_t *ep = n00b_result_get(er);
+
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(n00b_quic_endpoint_local_port(ep));
+    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
+
+    auto ccr = n00b_quic_connect(ep,
+                                 (const struct sockaddr *)&dst,
+                                 n00b_string_from_cstr("localhost"));
+    assert(n00b_result_is_ok(ccr));
+    n00b_quic_conn_t *conn = n00b_result_get(ccr);
+
+    auto dr = n00b_quic_chan_open(conn, .kind = N00B_QUIC_CHAN_DGRAM);
+    assert(n00b_result_is_ok(dr));
+    n00b_quic_chan_t *dgram = n00b_result_get(dr);
+
+    auto fr = n00b_quic_chan_open(conn);
+    assert(n00b_result_is_ok(fr));
+    n00b_quic_chan_t *framed = n00b_result_get(fr);
+
+    n00b_quic_chan_close(framed);
+    n00b_quic_chan_close(dgram);
+    n00b_quic_close(conn, 0);
+    n00b_quic_endpoint_close(ep);
+    n00b_conduit_io_destroy(io);
+    n00b_conduit_destroy(c);
+
+    assert(n00b_atomic_load(&rt->finalizer_count) == before);
+    printf("  [PASS] handles leave no finalizer entries\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -355,6 +420,8 @@ main(int argc, char **argv)
     test_endpoint_lb_cid_config_passes_through();
     fflush(stdout);
     test_conn_remote_cid_null_safety();
+    fflush(stdout);
+    test_handles_leave_no_finalizer_entries();
     fflush(stdout);
 
     printf("All quic endpoint tests passed.\n");

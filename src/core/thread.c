@@ -43,6 +43,7 @@ static void n00b_glibc_learn_pthread_layout(void);
 #include "n00b.h"
 #include "core/runtime.h"
 #include "core/thread.h"
+#include "core/arena.h"
 #include "adt/option.h"
 #include "core/atomic.h"
 #include "core/futex.h"
@@ -471,12 +472,16 @@ n00b_thread_retire_in_fork_child(n00b_runtime_t *rt, uint32_t slot)
     if (n00b_thread_slot_is_vacant(t)) {
         return;
     }
+    // Its allocations stay in the child's heap, so the ones its buffer has not
+    // yet added to the arena's count are added now.
+    n00b_arena_tlab_thread_exit(t);
     t->stack_map    = nullptr;
     t->stack_top    = nullptr;
     t->gc_stack_top = nullptr;
     for (int i = 0; i < 31; i++) {
         t->gc_captured_regs[i] = 0;
     }
+    t->gc_captured_vreg_words = 0;
     n00b_atomic_store(&t->gc_preempt_suspended, false);
 }
 
@@ -959,6 +964,8 @@ n00b_thread_destroy(void)
     // unregister below re-acquires the gate reentrantly — intended.
     n00b_runtime_t *destroy_gate_rt = n00b_get_runtime();
     n00b_rw_read_lock(&destroy_gate_rt->critical_execution);
+
+    n00b_arena_tlab_thread_exit(self);
 
     n00b_thread_record_t *rec = self->record;
 
@@ -2464,6 +2471,7 @@ n00b_thread_quarantine_dead_foreign_for_stw(n00b_thread_record_t *rec,
     for (int i = 0; i < 31; i++) {
         t->gc_captured_regs[i] = 0;
     }
+    t->gc_captured_vreg_words = 0;
     n00b_atomic_store(&t->gc_preempt_suspended, false);
     return true;
 #else

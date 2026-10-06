@@ -54,7 +54,7 @@ struct n00b_oob_hdr_t {
     // serialised format. n00b_add_finalizer uses this storage when
     // n00b_find_alloc_info returns an OOB record (i.e. the pool was
     // initialised with external_metadata=true). Pools without OOB
-    // records fall back to rt->finalizers list keyed on the user
+    // records fall back to the rt->finalizers dict keyed on the user
     // pointer.
     n00b_finalizer_t   finalizer;
     void              *finalizer_user;

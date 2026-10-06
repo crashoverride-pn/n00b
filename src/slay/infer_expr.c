@@ -223,8 +223,7 @@ get_child_type(infer_ctx_t *ctx, int32_t index)
     }
 
     bool           found = false;
-    uintptr_t      key   = (uintptr_t)child;
-    n00b_tc_type_t *t     = n00b_dict_get(ctx->node_types, key, &found);
+    n00b_tc_type_t *t     = n00b_dict_get(ctx->node_types, child, &found);
 
     return found ? t : NULL;
 }
@@ -528,8 +527,7 @@ parse_type_primary(infer_ctx_t *ctx)
             n00b_parse_tree_t *child = n00b_tree_get_nth_nt_child(ctx->node, index);
 
             if (child && ctx->node_types) {
-                uintptr_t key = (uintptr_t)child;
-                n00b_dict_put(ctx->node_types, key, ct);
+                n00b_dict_put(ctx->node_types, child, ct);
             }
         }
 
@@ -701,9 +699,8 @@ parse_type_primary(infer_ctx_t *ctx)
                 if (found_dot && receiver_node && method_name) {
                     // Get receiver's type from node_types.
                     bool rfound = false;
-                    uintptr_t rk = (uintptr_t)receiver_node;
                     n00b_tc_type_t *recv_type =
-                        n00b_dict_get(ctx->node_types, rk, &rfound);
+                        n00b_dict_get(ctx->node_types, receiver_node, &rfound);
 
                     if (rfound && recv_type) {
                         n00b_tc_type_t *rr = recv_type;
@@ -797,8 +794,7 @@ parse_type_primary(infer_ctx_t *ctx)
                 = n00b_tree_get_nth_nt_child(ctx->node, index);
 
             if (child && ctx->node_types) {
-                uintptr_t key = (uintptr_t)child;
-                n00b_dict_put(ctx->node_types, key, operand_type);
+                n00b_dict_put(ctx->node_types, child, operand_type);
             }
         }
 
@@ -938,9 +934,8 @@ parse_type_primary(infer_ctx_t *ctx)
         n00b_tc_type_t *recv_type = nullptr;
 
         if (receiver_node && ctx->node_types) {
-            bool      rf = false;
-            uintptr_t rk = (uintptr_t)receiver_node;
-            recv_type    = n00b_dict_get(ctx->node_types, rk, &rf);
+            bool rf   = false;
+            recv_type = n00b_dict_get(ctx->node_types, receiver_node, &rf);
 
             if (!rf) {
                 recv_type = nullptr;
@@ -948,9 +943,8 @@ parse_type_primary(infer_ctx_t *ctx)
         }
 
         if (!recv_type && target_node && ctx->node_types) {
-            bool      tf = false;
-            uintptr_t tk = (uintptr_t)target_node;
-            recv_type    = n00b_dict_get(ctx->node_types, tk, &tf);
+            bool tf   = false;
+            recv_type = n00b_dict_get(ctx->node_types, target_node, &tf);
 
             if (!tf) {
                 recv_type = nullptr;

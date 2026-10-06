@@ -211,13 +211,28 @@ typedef n00b_dict_t(n00b_earley_item_t *, bool) n00b_item_set_t;
 
 /**
  * @brief Allocate a new item set (pointer-identity dict used as a set).
+ *
+ * The default object hash caches an item's first address hash in its header,
+ * which moves with the item, so membership survives a copying collection.
  */
 static inline n00b_item_set_t *
 n00b_item_set_new(void)
 {
     n00b_item_set_t *s = n00b_alloc(n00b_item_set_t);
-    n00b_dict_init(s, .hash = n00b_hash_word, .skip_obj_hash = true);
+    n00b_dict_init(s);
     return s;
+}
+
+/**
+ * @brief A new tree-build cache for an item (`n00b_earley_item_t.cache`).
+ */
+static inline n00b_dict_t(n00b_earley_item_t *, void *) *
+n00b_earley_cache_new(void)
+{
+    n00b_dict_t(n00b_earley_item_t *, void *) *c
+        = n00b_alloc(n00b_dict_t(n00b_earley_item_t *, void *));
+    n00b_dict_init(c);
+    return c;
 }
 
 /**

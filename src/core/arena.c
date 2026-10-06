@@ -335,6 +335,12 @@ n00b_register_arena_segment(void *start, void *end, n00b_arena_t *arena) _kargs
  * (n00b#395).  Called after the bump CAS commits and before the caller writes
  * the allocation's guard word, so any scan that can find the guard also sees a
  * bound that covers it. */
+#if defined(N00B_DEBUG)
+_Atomic uint64_t n00b_arena_shared_bumps = 0;
+_Atomic uint64_t n00b_arena_extent_gates = 0;
+void (*n00b_arena_tlab_publish_hook)(void) = nullptr;
+#endif
+
 static inline void
 n00b_arena_note_alloc_extent(n00b_arena_t *arena, char *base, uint64_t len)
 {
@@ -361,6 +367,9 @@ n00b_arena_note_alloc_extent(n00b_arena_t *arena, char *base, uint64_t len)
 
     if (gate) {
         n00b_rw_read_lock(&rt->critical_execution);
+#if defined(N00B_DEBUG)
+        atomic_fetch_add_explicit(&n00b_arena_extent_gates, 1, memory_order_relaxed);
+#endif
     }
 
     n00b_segment_t *seg = n00b_atomic_load(&arena->current_segment);
@@ -647,9 +656,16 @@ arena_changed(n00b_arena_t *arena, char *desired_value)
     return false;
 }
 
-static void *
-n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
+// Claims `request` bytes at the arena's shared bump pointer. `object` is false
+// for a thread-buffer refill: the chunk is not an allocation, so it is neither
+// counted nor recorded as an allocation extent. `gen_out`, when set, receives
+// the collection count read before the bump that succeeded, so it already
+// includes any collection this call ran itself.
+static char *
+n00b_arena_bump_shared(n00b_arena_t *arena, uint64_t request, bool object, uint64_t *gen_out)
 {
+    extern _Atomic uint64_t n00b_gc_collect_count;
+
     char        *found_value;
     char        *desired_value;
     _Atomic bool already_collected = false;
@@ -664,6 +680,9 @@ n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
                                                      : nullptr;
 
     do {
+        if (gen_out != nullptr) {
+            *gen_out = n00b_atomic_load(&n00b_gc_collect_count);
+        }
         found_value   = n00b_atomic_load(&arena->next_alloc);
         desired_value = found_value + request;
 
@@ -699,6 +718,13 @@ n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
             }
             already_collected = true;
             n00b_restart_the_world();
+            // The world may still be stopped by an outer caller, and this
+            // allocation is not registered yet, so the queued finalizers run
+            // when the allocation returns (see _n00b_alloc_raw).
+            if (self != nullptr
+                && n00b_atomic_load(&n00b_get_runtime()->pending_finalizers_len) != 0) {
+                self->gc_run_finalizers = true;
+            }
             /* The conservative GC's stack scan can rewrite `found_value`
              * on this frame to a forwarded position (it looks like a
              * heap pointer; `scan_for_header` finds the previous
@@ -715,6 +741,9 @@ n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
              * Recompute both from the current atomic state before the
              * CAS.  `continue` in a do-while goes to the while-condition
              * (the CAS), so we re-read here explicitly. */
+            if (gen_out != nullptr) {
+                *gen_out = n00b_atomic_load(&n00b_gc_collect_count);
+            }
             found_value   = n00b_atomic_load(&arena->next_alloc);
             desired_value = found_value + request;
             /* RE-PUBLISH the in-flight reservation for the value the CAS below
@@ -759,11 +788,116 @@ n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
         }
     } while (!n00b_atomic_cas(&arena->next_alloc, &found_value, desired_value));
 
-    n00b_atomic_add(&arena->alloc_count, 1);
+#if defined(N00B_DEBUG)
+    atomic_fetch_add_explicit(&n00b_arena_shared_bumps, 1, memory_order_relaxed);
+#endif
 
-    n00b_arena_note_alloc_extent(arena, found_value, request);
+    if (object) {
+        n00b_atomic_add(&arena->alloc_count, 1);
+        n00b_arena_note_alloc_extent(arena, found_value, request);
+    }
 
     return found_value;
+}
+
+// Gives the thread a fresh buffer. A collection between claiming the chunk and
+// installing it retires the buffer, or leaves the chunk in a page it retained,
+// so the claim is repeated.
+static void
+n00b_arena_tlab_refill(n00b_arena_t *arena, n00b_thread_t *self)
+{
+    extern _Atomic uint64_t n00b_gc_collect_count;
+
+    while (true) {
+        uint64_t gen;
+        char    *base = n00b_arena_bump_shared(arena, N00B_TLAB_SIZE, false, &gen);
+
+        atomic_store_explicit(&self->tlab_end, nullptr, memory_order_relaxed);
+        atomic_store_explicit(&self->tlab_cur, base, memory_order_relaxed);
+        atomic_store_explicit(&self->tlab_end, base + N00B_TLAB_SIZE, memory_order_relaxed);
+        self->tlab_noted_len = 0;
+
+        if (n00b_atomic_load(&n00b_gc_collect_count) == gen) {
+            return;
+        }
+        atomic_store_explicit(&self->tlab_end, nullptr, memory_order_relaxed);
+        atomic_store_explicit(&self->tlab_cur, nullptr, memory_order_relaxed);
+    }
+}
+
+// Serves `request` from the thread's buffer, refilling it when it is spent.
+static char *
+n00b_arena_tlab_alloc(n00b_arena_t *arena, n00b_thread_t *self, uint64_t request)
+{
+    while (true) {
+        char *p   = atomic_load_explicit(&self->tlab_cur, memory_order_relaxed);
+        char *end = atomic_load_explicit(&self->tlab_end, memory_order_relaxed);
+
+        if (end == nullptr || p == nullptr || request > (uint64_t)(end - p)) {
+            n00b_arena_tlab_refill(arena, self);
+            continue;
+        }
+
+#if defined(N00B_DEBUG)
+        if (n00b_arena_tlab_publish_hook != nullptr) {
+            n00b_arena_tlab_publish_hook();
+        }
+#endif
+
+        // Same publication order as the shared path (n00b#431): `start` last.
+        atomic_store_explicit(&self->gc_inflight_len, request, memory_order_relaxed);
+        atomic_store_explicit(&self->gc_inflight_start, p, memory_order_release);
+
+        // A collection before the publish could have retired the buffer, or
+        // rewritten `p` on this stack to a to-space address. One after it
+        // pins the reservation, so `p` is safe to hand out from here on.
+        if (atomic_load_explicit(&self->tlab_cur, memory_order_relaxed) != p
+            || atomic_load_explicit(&self->tlab_end, memory_order_relaxed) != end) {
+            continue;
+        }
+
+        atomic_store_explicit(&self->tlab_cur, p + request, memory_order_relaxed);
+        self->tlab_allocs++;
+
+        if (request > self->tlab_noted_len) {
+            n00b_arena_note_alloc_extent(arena, p, request);
+            self->tlab_noted_len = request;
+        }
+        return p;
+    }
+}
+
+static void *
+n00b_arena_alloc(n00b_arena_t *arena, uint64_t request, void *ignore)
+{
+    (void)ignore;
+
+    if (arena->collection_enabled && request <= N00B_TLAB_MAX_OBJECT) {
+        n00b_runtime_t *rt = n00b_default_runtime_or_null();
+        if (rt != nullptr && arena == rt->default_arena
+            && !n00b_atomic_load(&rt->stw_active)) {
+            n00b_thread_t *self = n00b_thread_self();
+            if (self != nullptr) {
+                return n00b_arena_tlab_alloc(arena, self, request);
+            }
+        }
+    }
+
+    return n00b_arena_bump_shared(arena, request, true, nullptr);
+}
+
+void
+n00b_arena_tlab_thread_exit(n00b_thread_t *t)
+{
+    n00b_runtime_t *rt = n00b_default_runtime_or_null();
+    if (rt == nullptr || rt->default_arena == nullptr || t == nullptr) {
+        return;
+    }
+    uint64_t unseen = t->tlab_allocs - t->tlab_allocs_seen;
+    if (unseen != 0) {
+        n00b_atomic_add(&rt->default_arena->alloc_count, (uint32_t)unseen);
+        t->tlab_allocs_seen = t->tlab_allocs;
+    }
 }
 
 static void
@@ -894,6 +1028,7 @@ n00b_arena_reset(n00b_arena_t *arena)
         }
         arena->next_alloc = start;
         n00b_atomic_store(&arena->alloc_count, 0);
+        arena->md_inserts_unknown = true;
         n00b_atomic_fence();
         n00b_atomic_store(&arena->mutex, 0);
         return;

@@ -66,7 +66,29 @@ struct n00b_cf_label_s {
 // Walk result
 // ============================================================================
 
-typedef n00b_dict_t(uintptr_t, n00b_tc_type_t *) n00b_node_types_t;
+typedef n00b_dict_t(n00b_parse_tree_t *, n00b_tc_type_t *) n00b_node_types_t;
+
+// Both dicts are keyed by node identity. The default object hash caches a
+// node's first address hash in its header, which moves with the node, so a
+// lookup still finds a node the collector has moved.
+
+/** @brief A new cf_labels dict, keyed by parse tree node. */
+static inline n00b_cf_labels_t *
+n00b_cf_labels_new(void)
+{
+    n00b_cf_labels_t *labels = n00b_alloc(n00b_cf_labels_t);
+    n00b_dict_init(labels);
+    return labels;
+}
+
+/** @brief A new node_types dict, keyed by parse tree node. */
+static inline n00b_node_types_t *
+n00b_node_types_new(void)
+{
+    n00b_node_types_t *node_types = n00b_alloc(n00b_node_types_t);
+    n00b_dict_init(node_types);
+    return node_types;
+}
 
 /**
  * @brief Result of a full annotation walk (symtab + control flow labels).

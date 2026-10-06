@@ -43,7 +43,7 @@
  * @param symtab      Symbol table (for `lookup($N)`).
  * @param grammar     Grammar (for child resolution).
  * @param node        The parse tree node being annotated.
- * @param node_types  Dict mapping `(uintptr_t)node → n00b_tc_type_t *`.
+ * @param node_types  Dict mapping parse tree node to `n00b_tc_type_t *`.
  * @param expr        The `@infer` expression string to evaluate.
  * @return            The resulting type, or NULL on parse/eval error.
  */

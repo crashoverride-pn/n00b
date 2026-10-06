@@ -16,7 +16,7 @@ how to use what's there today.
 |  H3 (Phase 4)              |  RPC (Phase 4)                |
 +----------------------------+-------------------------------+
 |  Transport: endpoint, conn, channels  ✓                    |
-|    accept-topic, recv path, qlog, finalizers, stats  ✓     |
+|    accept-topic, recv path, qlog, stats  ✓                 |
 |  Wire framer (varint + 1-byte type tag)  ✓                 |
 +------------------------------------------------------------+
 |  picoquic + picotls (vendored, minicrypto-only)  ✓         |
@@ -90,8 +90,9 @@ A UDP socket plus a picoquic context.
   events.  Each new picoquic-accepted cnx is wrapped as
   `n00b_quic_conn_t` and published once with payload
   `n00b_quic_accept_event_t`.
-- `n00b_quic_endpoint_close` — idempotent, also runs as the GC
-  finalizer if the user drops the handle.
+- `n00b_quic_endpoint_close`: idempotent. Handles live in
+  `conduit_pool`, which the collector does not reclaim per object, so a
+  handle dropped without closing keeps its socket and picoquic state.
 - `n00b_quic_endpoint_stats` — per-endpoint packet counters.
 - `n00b_quic_endpoint_local_port` — bound port (useful when port=0
   selected an ephemeral port).
@@ -116,7 +117,7 @@ One QUIC connection = one peer = one TLS session.
   list (use with `n00b_quic_chan_next_in_conn` to walk).
 - Server conns auto-unlinked from `endpoint->accepted` on
   `picoquic_callback_close` so long-lived servers don't leak.
-- Finalizer registered: GC reclaims if the user drops the handle.
+- Released only by `n00b_quic_close`; a dropped handle is not reclaimed.
 
 ### Channel — `include/net/quic/chan.h`
 
@@ -144,7 +145,8 @@ One channel = one QUIC stream + n00b's framing semantics.
 - Recv events come from picoquic's per-cnx callback; STREAM_DATA
   bytes accumulate in a per-channel recv buffer (geometric grow,
   conduit-pool no_scan).
-- Finalizer registered.
+- Released only by `n00b_quic_chan_close`; a dropped handle is not
+  reclaimed.
 
 ### Trust — `include/net/quic/trust.h`
 
@@ -242,9 +244,8 @@ Per `docs/net/quic/allocator.md` (mandatory):
 2. GC roots: any file-scope global holding QUIC state must call
    `n00b_gc_register_root(var)` after `n00b_init`.  (No such
    globals in the QUIC module itself today.)
-3. Finalizers registered on endpoint / conn / chan via
-   `_n00b_alloc_raw(.finalizer = ...)` — GC reclaims OS resources
-   if user drops the handle without explicit close.
+3. Endpoints, conns, and channels are released only by their close
+   calls; nothing reclaims a dropped handle.
 
 Cross-thread: picoquic is single-threaded.  Call `run_once` from
 one thread.  Multi-threaded `run_once` is future work.

@@ -19,6 +19,14 @@
  */
 #pragma once
 
+// Capacity of n00b_thread_t.gc_captured_vregs, in words. Linux copies the
+// signal frame's XSAVE area (AVX-512 state is about 2.5KB) or SVE registers.
+#if defined(__linux__)
+#define N00B_GC_VREG_WORDS 512
+#else
+#define N00B_GC_VREG_WORDS 64
+#endif
+
 #include "n00b.h"
 #include "core/platform.h"
 #include "core/rt_access.h"
@@ -315,6 +323,17 @@ struct n00b_thread_t {
      */
     uint64_t                           gc_captured_regs[31];
     /**
+     * @brief  SIMD/FP register state captured with @ref gc_captured_regs,
+     *         as raw words: arm64 v0-v31 (plus SVE z0-z31 on Linux), and on
+     *         x86-64 xmm0-15 plus, on Linux, the rest of the XSAVE area (ymm,
+     *         zmm). A vectorized copy of a pointer array holds heap pointers
+     *         here and nowhere else, so these are pinned like the GP
+     *         registers. The first @ref gc_captured_vreg_words words are
+     *         valid while @ref gc_preempt_suspended.
+     */
+    uint64_t                           gc_captured_vregs[N00B_GC_VREG_WORDS];
+    uint32_t                           gc_captured_vreg_words;
+    /**
      * @brief  In-flight allocation reservation, published BEFORE a thread
      *         commits an arena bump and cleared after the object's GC metadata
      *         (inline header / OOB record) is registered.  A thread can be
@@ -329,6 +348,25 @@ struct n00b_thread_t {
      */
     _Atomic(void *)                    gc_inflight_start;
     _Atomic(uint64_t)                  gc_inflight_len;
+    /// Set by an out-of-memory collect this thread ran that queued
+    /// finalizers; the allocation that triggered it runs them before returning.
+    bool                               gc_run_finalizers;
+    /// Thread-local allocation buffer in the runtime's default arena:
+    /// [tlab_cur, tlab_end) was reserved with one shared bump and is handed
+    /// out with plain stores. Only this thread writes these, except that the
+    /// collector retires the buffer (both null) with the world stopped.
+    _Atomic(char *)                    tlab_cur;
+    _Atomic(char *)                    tlab_end;
+    /// Largest allocation already recorded against the buffer's mapping
+    /// (n00b#395), so smaller ones skip n00b_arena_note_alloc_extent.
+    uint64_t                           tlab_noted_len;
+    /// Objects this thread has handed out from buffers. Only this thread
+    /// writes it.
+    uint64_t                           tlab_allocs;
+    /// The tlab_allocs value already added to the arena's alloc_count. Only
+    /// the collector (world stopped) and this thread's teardown (under the
+    /// critical_execution gate) write it, so neither races the other.
+    uint64_t                           tlab_allocs_seen;
     n00b_thread_record_t              *record; ///< Pointer into rt->threads[slot].
     // @brief Scoped allocator override (was __n00b_current_allocator).
     n00b_allocator_t                  *current_allocator;

@@ -466,7 +466,7 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
 
     n00b_allocator_t *rpool = (n00b_allocator_t *)&rt->system_pool;
     rt->gc_roots            = n00b_list_new(n00b_gc_root_t, .allocator = rpool);
-    rt->finalizers     = n00b_list_new_private(n00b_finalizer_info_t *, .allocator = rpool);
+    n00b_finalizer_index_init(rt);
     /* See runtime.h: every external_metadata pool registers here so
      * the GC mark phase can walk per-alloc metadata directly. */
     rt->metadata_pools = n00b_list_new(n00b_allocator_t *, .allocator = rpool);

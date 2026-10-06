@@ -3743,6 +3743,41 @@ finalizer_test = executable('test_finalizer',
 )
 test('finalizer', finalizer_test, suite: 'unit')
 
+gc_vreg_pin_test = executable('test_gc_vreg_pin',
+    ['test/unit/test_gc_vreg_pin.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_vreg_pin', gc_vreg_pin_test, suite: 'unit')
+
+gc_register_sweep_test = executable('test_gc_register_sweep',
+    ['test/unit/test_gc_register_sweep.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_register_sweep', gc_register_sweep_test, suite: 'unit')
+
+gc_address_keyed_tables_test = executable('test_gc_address_keyed_tables',
+    ['test/unit/test_gc_address_keyed_tables.c'],
+    kwargs: test_common_kwargs + {
+        # slay/codegen.h, for the field-lock table, includes mir.h.
+        'dependencies': test_common_kwargs['dependencies'] + [mir_dep],
+    },
+)
+test('gc_address_keyed_tables', gc_address_keyed_tables_test, suite: 'unit')
+
+gc_pin_all_segments_test = executable('test_gc_pin_all_segments',
+    ['test/unit/test_gc_pin_all_segments.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_pin_all_segments', gc_pin_all_segments_test, suite: 'unit')
+
+arena_tlab_test = executable('test_arena_tlab',
+    ['test/unit/test_arena_tlab.c'],
+    kwargs: test_common_kwargs,
+)
+test('arena_tlab', arena_tlab_test, suite: 'unit')
+test('arena_tlab_pin_all', arena_tlab_test, suite: 'unit',
+     env: ['N00B_GC_PIN_ALL=1'])
+
 current_allocator_test = executable('test_current_allocator',
     ['test/unit/test_current_allocator.c'],
     kwargs: test_common_kwargs + {

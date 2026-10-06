@@ -534,10 +534,7 @@ get_node(n00b_earley_parser_t *p, n00b_earley_item_t *b)
 
     // Create cache dict if needed.
     if (!top->cache) {
-        top->cache = n00b_alloc(n00b_dict_t(n00b_earley_item_t *, void *));
-        n00b_dict_init(top->cache,
-                       .hash = n00b_hash_word,
-                       .skip_obj_hash = true);
+        top->cache = n00b_earley_cache_new();
     }
 
     n00b_dict_put(top->cache, b, result);

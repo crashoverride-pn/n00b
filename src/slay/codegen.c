@@ -840,22 +840,7 @@ lookup_node_type(n00b_annot_result_t *a, n00b_parse_tree_t *node)
     }
 
     bool            found = false;
-    uintptr_t       key   = (uintptr_t)node;
-    n00b_tc_type_t *type  = n00b_dict_get(a->node_types, key, &found);
-
-    if (found && type) {
-        return type;
-    }
-
-    // A moving GC can update pointer-like keys after the dict has been
-    // bucketed. Fall back to a linear scan before treating a node as untyped.
-    n00b_dict_foreach(a->node_types, stored_key, stored_type, {
-        if (stored_key == key) {
-            type  = stored_type;
-            found = true;
-            break;
-        }
-    });
+    n00b_tc_type_t *type  = n00b_dict_get(a->node_types, node, &found);
 
     return found ? type : nullptr;
 }
@@ -899,22 +884,7 @@ n00b_codegen_cf_label(n00b_cg_session_t *s, n00b_parse_tree_t *node)
         return nullptr;
     }
 
-    n00b_cf_label_t *label = n00b_cf_label_lookup(a->cf_labels, node);
-
-    if (label || !a->cf_labels || !node) {
-        return label;
-    }
-
-    // See lookup_node_type(): after GC relocation, pointer-key dictionaries
-    // may contain updated keys in old buckets. Iteration still sees them.
-    n00b_dict_foreach(a->cf_labels, stored_node, stored_label, {
-        if (stored_node == node || (stored_label && stored_label->self == node)) {
-            label = stored_label;
-            break;
-        }
-    });
-
-    return label;
+    return n00b_cf_label_lookup(a->cf_labels, node);
 }
 
 n00b_grammar_t *
@@ -6871,10 +6841,13 @@ n00b_field_lock_guard_unlock(void)
     n00b_data_unlock(n00b_field_lock_guard);
 }
 
+// The object hash is cached in the allocation header on first use, so it
+// follows the object when the collector moves it.
 static uint64_t
 n00b_field_lock_hash(void *obj, int64_t offset)
 {
-    uint64_t x = (uint64_t)((uintptr_t)obj >> 3) ^ ((uint64_t)offset * 0x9e3779b97f4a7c15ULL);
+    n00b_uint128_t h = n00b_hash(obj, nullptr);
+    uint64_t       x = ((uint64_t)h ^ (uint64_t)(h >> 64)) ^ ((uint64_t)offset * 0x9e3779b97f4a7c15ULL);
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33;
@@ -6944,6 +6917,23 @@ n00b_field_lock_insert(void *obj, int64_t offset)
     n00b_field_lock_buckets[bucket] = entry;
     n00b_field_lock_count++;
 }
+
+#if defined(N00B_DEBUG)
+void
+n00b_cg_debug_lock_field(void *obj, int64_t offset)
+{
+    n00b_builtin_field_set_and_lock(obj, offset, *(uint64_t *)((char *)obj + offset));
+}
+
+bool
+n00b_cg_debug_field_is_locked(void *obj, int64_t offset)
+{
+    n00b_field_lock_guard_read();
+    bool locked = n00b_field_lock_find(obj, offset);
+    n00b_field_lock_guard_unlock();
+    return locked;
+}
+#endif
 
 static void
 n00b_field_lock_fail(void)

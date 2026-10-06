@@ -289,6 +289,8 @@ static bool
 n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool base_checked);
 static void n00b_collection_cleanup(n00b_collect_t *);
 static void n00b_process_finalizers(n00b_collect_t *);
+static void n00b_scan_pending_finalizers(n00b_collect_t *);
+static void n00b_gc_settle_tlabs(n00b_arena_t *arena, bool retire);
 static void n00b_scan_metadata_pools(n00b_collect_t *);
 static void n00b_sweep_metadata_pool_leaks(n00b_collect_t *);
 #if defined(N00B_CENSUS_ENABLED)
@@ -320,7 +322,6 @@ static void n00b_add_described_scan_range_to_worklist(n00b_collect_t     *ctx,
                                                       n00b_gc_scan_cb_t   scan_cb,
                                                       void               *scan_user,
                                                       n00b_alloc_info_t   origin);
-static inline bool n00b_addr_in_arena(void *addr, n00b_arena_t *arena);
 // Mostly-copying pin support (ambiguous-root pinning).
 static void        n00b_pin_bitmaps_alloc(n00b_collect_t *ctx);
 static void        n00b_pin_candidate(n00b_collect_t *ctx, void *candidate);
@@ -339,6 +340,8 @@ _Atomic uint64_t n00b_gc_last_pinned_pages   = 0;
 _Atomic uint64_t n00b_gc_last_freed_pages    = 0;
 _Atomic uint64_t n00b_gc_last_retained_runs  = 0;
 _Atomic uint64_t n00b_gc_last_nobitmap_segs  = 0;
+_Atomic uint64_t n00b_gc_last_segment_lookups      = 0;
+_Atomic uint64_t n00b_gc_last_segment_lookup_steps = 0;
 _Atomic uint64_t n00b_gc_total_pinned_pages  = 0;
 _Atomic uint64_t n00b_gc_total_freed_pages   = 0;
 _Atomic uint64_t n00b_gc_collect_count       = 0;
@@ -1997,6 +2000,7 @@ n00b_process_worklist(n00b_collect_t *ctx)
 
 typedef struct {
     n00b_allocator_t *allocator;
+    n00b_segment_t   *segment; // The arena segment; null for a pool page.
 } n00b_scan_owner_t;
 
 static void
@@ -2042,7 +2046,7 @@ n00b_scan_tree_add_allocator(n00b_allocator_t *al, void *arg)
                     tree,
                     lo,
                     hi,
-                    ((n00b_scan_owner_t){.allocator = al}));
+                    ((n00b_scan_owner_t){.allocator = al, .segment = seg}));
             }
             seg = seg->next_segment;
         }
@@ -2459,18 +2463,31 @@ n00b_scan_thread_heap_fields(n00b_collect_t *ctx, n00b_thread_t *t)
 // aborting, masking the real fault) when a thread is caught on its altstack.
 // Returns false when the SP is in neither known region (e.g. a not-yet-fully-
 // on-stack thread, or teardown residue) — the caller then skips the range scan.
+// Bytes below SP that the ABI lets leaf code use without moving SP: the x86-64
+// SysV and Apple arm64 red zones. A thread suspended in such a leaf can hold its
+// only reference to an object there.
+#if (defined(__x86_64__) && !defined(_WIN32)) || (defined(__APPLE__) && defined(__aarch64__))
+#define N00B_STACK_RED_ZONE 128
+#else
+#define N00B_STACK_RED_ZONE 0
+#endif
+
 static inline bool
 n00b_thread_stack_scan_bounds(volatile n00b_thread_t *t,
                               uint64_t              **top_out,
                               uint64_t              **base_out)
 {
-    uint64_t sp = (uint64_t)t->stack_top;
+    uint64_t sp  = (uint64_t)t->stack_top;
+    uint64_t low = sp;
+    if (n00b_atomic_load(&t->gc_preempt_suspended)) {
+        low = sp - N00B_STACK_RED_ZONE;
+    }
 
     // Main stack: SP at/below its high end. Clamp SP up into the usable region
     // if it sits just below `start` (in the guard band).
     n00b_mmap_info_t *m = t->stack_map;
     if (m != nullptr && sp < m->end) {
-        *top_out  = (uint64_t *)(sp < m->start ? m->start : sp);
+        *top_out  = (uint64_t *)(low < m->start ? m->start : low);
         *base_out = (uint64_t *)m->end;
         return true;
     }
@@ -2482,7 +2499,7 @@ n00b_thread_stack_scan_bounds(volatile n00b_thread_t *t,
     if (as != nullptr
         && sp >= (uint64_t)as->stack_low
         && sp < (uint64_t)as->stack_high) {
-        *top_out  = (uint64_t *)sp;
+        *top_out  = (uint64_t *)(low < (uint64_t)as->stack_low ? (uint64_t)as->stack_low : low);
         *base_out = (uint64_t *)as->stack_high;
         return true;
     }
@@ -2704,6 +2721,8 @@ n00b_scan_runtime(n00b_collect_t *ctx)
                                rt->envp.len * sizeof(char *) / sizeof(void *));
         n00b_process_worklist(ctx);
     }
+
+    n00b_scan_pending_finalizers(ctx);
 }
 
 // ============================================================================
@@ -2959,27 +2978,6 @@ _n00b_gc_unregister_root(void *addr)
 }
 
 // ============================================================================
-// Finalizer processing
-// ============================================================================
-
-static inline bool
-n00b_addr_in_arena(void *addr, n00b_arena_t *arena)
-{
-    n00b_segment_t *seg = arena->current_segment;
-
-    while (seg) {
-        char *start = seg->data;
-        char *end   = start + seg->size;
-
-        if ((char *)addr >= start && (char *)addr < end) {
-            return true;
-        }
-        seg = seg->next_segment;
-    }
-    return false;
-}
-
-// ============================================================================
 // Mostly-copying pin support (ambiguous-root pinning)
 //
 // A preemptively-suspended thread's captured general-purpose registers are
@@ -3033,16 +3031,35 @@ n00b_alloc_footprint(n00b_alloc_info_t ainfo, char **start, uint64_t *len)
     }
 }
 
-// The from-space segment whose data region contains `addr`, or null.
+// The from-space segment whose data region contains `addr`, or null. Answered
+// from the per-collect scan tree: the from-space chain gains a segment for
+// every retained page run, so walking it per lookup grows with the heap's
+// fragmentation.
 static inline n00b_segment_t *
 n00b_from_segment_for(n00b_collect_t *ctx, char *addr)
 {
-    n00b_segment_t *seg = ctx->from_space->current_segment;
-    while (seg) {
-        if (addr >= seg->data && addr < seg->data + seg->size) {
-            return seg;
+    n00b_interval_tree_t(n00b_scan_owner_t) *tree = ctx->scan_tree;
+    uint64_t                                 a    = (uint64_t)addr;
+
+    ctx->segment_lookups++;
+    if (tree == nullptr) {
+        return nullptr;
+    }
+    n00b_interval_node_t(n00b_scan_owner_t) *node = tree->root;
+    while (node != nullptr) {
+        ctx->segment_lookup_steps++;
+        if (a >= node->low && a < node->high) {
+            if (node->data.allocator != (n00b_allocator_t *)ctx->from_space) {
+                return nullptr;
+            }
+            return node->data.segment;
         }
-        seg = seg->next_segment;
+        if (node->left != nullptr && node->left->maximum > a) {
+            node = node->left;
+        }
+        else {
+            node = node->right;
+        }
     }
     return nullptr;
 }
@@ -3118,27 +3135,11 @@ n00b_pin_raw_range(n00b_collect_t *ctx, char *start, uint64_t len)
 static void
 n00b_pin_candidate(n00b_collect_t *ctx, void *candidate)
 {
-    if (!candidate) {
+    if ((uint64_t)candidate < ctx->scan_floor || (uint64_t)candidate >= ctx->scan_ceiling) {
         return;
     }
-
-    auto mmap_opt = n00b_mmap_by_address(candidate);
-    if (!n00b_option_is_set(mmap_opt)) {
-        return;
-    }
-    n00b_mmap_info_t *mmap = n00b_option_get(mmap_opt);
-    if (!n00b_mmap_is_gc_scannable(mmap)) {
-        return;
-    }
-    // Only addresses backed by the arena we are collecting can pin.
-    if (mmap->allocator != (n00b_allocator_t *)ctx->from_space) {
-        return;
-    }
-    switch (mmap->kind) {
-    case n00b_mmap_managed_segment:
-    case n00b_mmap_sys_segment:
-        break;
-    default:
+    // Only addresses in a segment of the arena we are collecting can pin.
+    if (n00b_from_segment_for(ctx, candidate) == nullptr) {
         return;
     }
 
@@ -3173,6 +3174,9 @@ n00b_pin_prepass(n00b_collect_t *ctx)
         }
         for (uint32_t r = 0; r < 31; r++) {
             n00b_pin_candidate(ctx, (void *)t->gc_captured_regs[r]);
+        }
+        for (uint32_t v = 0; v < t->gc_captured_vreg_words; v++) {
+            n00b_pin_candidate(ctx, (void *)t->gc_captured_vregs[v]);
         }
         // Pin this thread's in-flight allocation reservation: storage was bumped
         // but the object's GC metadata is not yet registered, so the trace can't
@@ -3288,22 +3292,6 @@ n00b_scan_pinned_in_place(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
                                               scan_cb,
                                               scan_user,
                                               origin);
-}
-
-// Check if a finalizer entry's object was in the from_space being collected.
-// For OOB arenas, the alloc_info is an OOB record (in the metadata pool,
-// NOT in from_space), so we check the OOB record's user_ptr instead.
-// For inline-only arenas, the alloc_info IS the inline header in from_space.
-static inline bool
-n00b_finalizer_in_from_space(n00b_finalizer_info_t *entry, n00b_collect_t *ctx)
-{
-    if (ctx->from_space->vtable.metadata_pool) {
-        // OOB arena: alloc_info is n00b_oob_hdr_t*, check user_ptr.
-        n00b_oob_hdr_t *oob = (n00b_oob_hdr_t *)entry->alloc_info;
-        return n00b_addr_in_arena(oob->user_ptr, ctx->from_space);
-    }
-    // Inline-only: alloc_info is the inline header in the segment.
-    return n00b_addr_in_arena(entry->alloc_info, ctx->from_space);
 }
 
 // ============================================================================
@@ -3487,52 +3475,309 @@ n00b_sweep_metadata_pool_leaks(n00b_collect_t *ctx)
     }
 }
 
-static void
-n00b_process_finalizers(n00b_collect_t *ctx)
-{
-    n00b_runtime_t *rt = n00b_get_runtime();
+// ============================================================================
+// Finalizers
+//
+// A finalizer's data word is a reference held by its object: while the object
+// is reached, the data is traced (and updated if its target moves). An object
+// the mark did not reach survives this collection: its finalizer is detached
+// onto rt->pending_finalizers, the data is traced from there, and
+// n00b_gc_run_finalizers runs it once the world is running again. The next
+// collection that finds the object unreachable reclaims it.
+// ============================================================================
 
-    if (!rt || !rt->finalizers.data) {
-        return;
+static inline void
+n00b_trace_finalizer_data(n00b_collect_t *ctx, void **slot)
+{
+    n00b_visit_possible_pointer(ctx, (uint64_t **)slot, 0, true);
+}
+
+static void
+n00b_pending_finalizer_push(n00b_runtime_t *rt, n00b_finalizer_t fn, void *user)
+{
+    n00b_allocator_t *sp  = (n00b_allocator_t *)&rt->system_pool;
+    uint32_t          len = n00b_atomic_load(&rt->pending_finalizers_len);
+
+    if (len == rt->pending_finalizers_cap) {
+        uint32_t               cap   = len ? len * 2 : 16;
+        n00b_finalizer_info_t *grown = n00b_alloc_array_with_opts(
+            n00b_finalizer_info_t,
+            cap,
+            &(n00b_alloc_opts_t){.allocator = sp});
+        n00b_finalizer_info_t *old = rt->pending_finalizers;
+        if (len) {
+            memcpy(grown, old, len * sizeof(n00b_finalizer_info_t));
+        }
+        rt->pending_finalizers     = grown;
+        rt->pending_finalizers_cap = cap;
+        if (old != nullptr) {
+            n00b_free(old, .allocator = sp);
+        }
     }
 
-    size_t len = n00b_list_len(rt->finalizers);
+    rt->pending_finalizers[len] = (n00b_finalizer_info_t){
+        .funcptr  = fn,
+        .user_ptr = user,
+    };
+    n00b_atomic_store(&rt->pending_finalizers_len, len + 1);
+}
 
-    for (size_t i = len; i > 0; i--) {
-        n00b_finalizer_info_t *entry = n00b_list_get(rt->finalizers, i - 1);
-        bool                   found;
-        n00b_inline_hdr_t     *fw;
+// Pending finalizers from earlier collections are roots until they run.
+static void
+n00b_scan_pending_finalizers(n00b_collect_t *ctx)
+{
+    n00b_runtime_t *rt  = n00b_get_runtime();
+    uint32_t        len = n00b_atomic_load(&rt->pending_finalizers_len);
 
-        // alloc_info is null for entries tied to allocators without
-        // GC metadata (e.g. system_pool). Such allocations are never
-        // in a from_space, so the sweep has nothing to do — release
-        // happens via the n00b_free path instead.
-        if (entry->alloc_info == nullptr) {
+    for (uint32_t i = 0; i < len; i++) {
+        n00b_trace_finalizer_data(ctx, &rt->pending_finalizers[i].user_ptr);
+    }
+    n00b_process_worklist(ctx);
+}
+
+// One pass over the from-space OOB records that carry a finalizer. A reached
+// record has its data traced from its to-space copy. With `queue_dead`, an
+// unreached one is detached and resurrected. Returns the number reached.
+static uint64_t
+n00b_finalizers_oob_pass(n00b_collect_t *ctx, bool queue_dead)
+{
+    n00b_arena_t   *from = ctx->from_space;
+    n00b_runtime_t *rt   = n00b_get_runtime();
+    uint64_t        reached = 0;
+
+    __n00b_internal_type_erased_store_t *store
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&from->vtable.metadata->store);
+    if (store == nullptr) {
+        return 0;
+    }
+    uint32_t slots = store->last_slot + 1;
+
+    for (uint32_t bi = 0; bi < slots; bi++) {
+        n00b_dict_bucket_t *b = &store->buckets[bi];
+        if (b->hv == (n00b_uint128_t)0
+            || (n00b_atomic_load(&b->flags) & N00B_HT_FLAG_DELETED)) {
+            continue;
+        }
+        n00b_oob_hdr_t *oob = (n00b_oob_hdr_t *)store->values[bi];
+        if (oob == nullptr || !oob->alive || oob->finalizer == nullptr) {
             continue;
         }
 
-        fw = n00b_dict_untyped_get(&ctx->memos, entry->alloc_info, &found);
+        bool               found = false;
+        n00b_inline_hdr_t *fw    = n00b_dict_untyped_get(&ctx->memos, oob, &found);
 
         if (found) {
-            // Object survived — update alloc_info to the forwarded header.
-            // fw is nullptr when the allocation was scanned but lives in
-            // a *different* arena (not the one being collected).  In that
-            // case, leave alloc_info alone — it still points to the
-            // original (valid) header in that other arena.
-            if (fw) {
-                entry->alloc_info = fw;
+            n00b_oob_hdr_t *live = (fw == (n00b_inline_hdr_t *)oob)
+                                     ? n00b_md_get(ctx->to_space->vtable.metadata,
+                                                   oob->user_ptr)
+                                     : (n00b_oob_hdr_t *)fw;
+            if (live != nullptr && live->finalizer != nullptr) {
+                n00b_trace_finalizer_data(ctx, &live->finalizer_user);
+                reached++;
             }
-            // user_ptr typically points outside the collected arena
-            // (e.g., a lock in system_pool), so no update needed.
+            continue;
         }
-        else if (n00b_finalizer_in_from_space(entry, ctx)) {
-            // Object is dead — run finalizer and remove entry.
-            entry->funcptr(entry->user_ptr);
-            (void)n00b_list_delete(rt->finalizers, i - 1);
-            n00b_free(entry);
+
+        if (queue_dead) {
+            n00b_finalizer_t fn   = oob->finalizer;
+            void            *user = oob->finalizer_user;
+            oob->finalizer        = nullptr;
+            oob->finalizer_user   = nullptr;
+            n00b_pending_finalizer_push(rt, fn, user);
+            uint32_t at = n00b_atomic_load(&rt->pending_finalizers_len) - 1;
+            n00b_trace_finalizer_data(ctx, &rt->pending_finalizers[at].user_ptr);
         }
-        // else: object in a different arena, leave alone.
     }
+
+    n00b_process_worklist(ctx);
+    return reached;
+}
+
+typedef struct {
+    void                  *key;
+    n00b_finalizer_info_t *info;
+} n00b_finalizer_rekey_t;
+
+// The index counterpart of n00b_finalizers_oob_pass. Entries whose object lies
+// outside the from-space are live as far as this collection knows, so their
+// data is traced too. With `queue_dead`, unreached from-space entries are
+// removed and resurrected, and entries whose object moved are re-keyed.
+static uint64_t
+n00b_finalizers_index_pass(n00b_collect_t *ctx, bool queue_dead)
+{
+    n00b_runtime_t *rt      = n00b_get_runtime();
+    uint64_t        reached = 0;
+
+    if (rt->finalizers == nullptr || n00b_atomic_load(&rt->finalizer_count) == 0) {
+        return 0;
+    }
+
+    __n00b_internal_type_erased_store_t *store
+        = (__n00b_internal_type_erased_store_t *)n00b_atomic_load(&rt->finalizers->store);
+    if (store == nullptr) {
+        return 0;
+    }
+    uint32_t slots = store->last_slot + 1;
+
+    n00b_allocator_t       *wa     = (n00b_allocator_t *)&ctx->work_pool;
+    n00b_finalizer_rekey_t *rekeys = nullptr;
+    uint32_t                nrekey = 0;
+    if (queue_dead) {
+        rekeys = n00b_alloc_array_with_opts(n00b_finalizer_rekey_t,
+                                            n00b_atomic_load(&rt->finalizer_count),
+                                            &(n00b_alloc_opts_t){.allocator = wa});
+    }
+
+    for (uint32_t bi = 0; bi < slots; bi++) {
+        n00b_dict_bucket_t *b = &store->buckets[bi];
+        if (b->hv == (n00b_uint128_t)0
+            || (n00b_atomic_load(&b->flags) & N00B_HT_FLAG_DELETED)) {
+            continue;
+        }
+        n00b_finalizer_info_t *info = (n00b_finalizer_info_t *)store->values[bi];
+        if (info == nullptr) {
+            continue;
+        }
+
+        if (n00b_from_segment_for(ctx, info->key) == nullptr) {
+            n00b_trace_finalizer_data(ctx, &info->user_ptr);
+            continue;
+        }
+
+        n00b_alloc_info_t ainfo = n00b_find_alloc_info(info->key);
+        if (!n00b_alloc_info_is_heap(ainfo)) {
+            continue;
+        }
+        n00b_inline_hdr_t *hdr   = alloc_info_raw_hdr(ainfo);
+        bool               found = false;
+        n00b_inline_hdr_t *fw    = n00b_dict_untyped_get(&ctx->memos, hdr, &found);
+
+        if (found) {
+            n00b_trace_finalizer_data(ctx, &info->user_ptr);
+            reached++;
+            if (queue_dead && fw != nullptr && fw != hdr) {
+                rekeys[nrekey++] = (n00b_finalizer_rekey_t){.key = info->key, .info = info};
+            }
+            continue;
+        }
+
+        if (queue_dead) {
+            n00b_pending_finalizer_push(rt, info->funcptr, info->user_ptr);
+            uint32_t at = n00b_atomic_load(&rt->pending_finalizers_len) - 1;
+            n00b_trace_finalizer_data(ctx, &rt->pending_finalizers[at].user_ptr);
+            info->funcptr = nullptr;
+            rekeys[nrekey++] = (n00b_finalizer_rekey_t){.key = info->key, .info = info};
+        }
+    }
+
+    n00b_process_worklist(ctx);
+
+    // The dict is not mutated while its store is being walked.
+    for (uint32_t i = 0; i < nrekey; i++) {
+        n00b_finalizer_info_t *info = rekeys[i].info;
+        void                  *key  = rekeys[i].key;
+
+        (void)_n00b_dict_internal_remove(rt->finalizers, N00B_MD_KSZ, N00B_MD_VSZ, &key);
+
+        if (info->funcptr == nullptr) {
+            atomic_fetch_sub_explicit(&rt->finalizer_count, 1, memory_order_acq_rel);
+            n00b_free(info, .allocator = (n00b_allocator_t *)&rt->system_pool);
+            continue;
+        }
+
+        n00b_alloc_info_t  ainfo = n00b_find_alloc_info(key);
+        n00b_inline_hdr_t *hdr   = alloc_info_raw_hdr(ainfo);
+        bool               found = false;
+        n00b_inline_hdr_t *fw    = n00b_dict_untyped_get(&ctx->memos, hdr, &found);
+        void              *moved = (char *)fw + ((char *)key - (char *)hdr);
+
+        info->key = moved;
+        (void)_n00b_dict_internal_put(rt->finalizers, N00B_MD_KSZ, N00B_MD_VSZ, &moved, &info);
+    }
+
+    return reached;
+}
+
+static void
+n00b_process_finalizers(n00b_collect_t *ctx)
+{
+    bool     oob  = ctx->from_space->vtable.metadata_pool != nullptr
+              && n00b_atomic_load(&ctx->from_space->vtable.oob_finalizers);
+    uint64_t prev = UINT64_MAX;
+    uint64_t now  = 0;
+
+    // Tracing one finalizer's data can reach another finalizable object, so
+    // repeat until the reached set stops growing before calling anything dead.
+    while (now != prev) {
+        prev = now;
+        now  = n00b_finalizers_index_pass(ctx, false);
+        if (oob) {
+            now += n00b_finalizers_oob_pass(ctx, false);
+        }
+    }
+
+    (void)n00b_finalizers_index_pass(ctx, true);
+    uint64_t oob_live = oob ? n00b_finalizers_oob_pass(ctx, true) : 0;
+
+    // A resurrected object can reach a finalizable one the dead pass had not
+    // looked at yet; trace that one's data as well.
+    prev = UINT64_MAX;
+    now  = 0;
+    while (now != prev) {
+        prev = now;
+        now  = n00b_finalizers_index_pass(ctx, false);
+        if (oob) {
+            oob_live = n00b_finalizers_oob_pass(ctx, false);
+            now += oob_live;
+        }
+    }
+
+    if (oob && oob_live == 0) {
+        n00b_atomic_store(&ctx->from_space->vtable.oob_finalizers, false);
+    }
+}
+
+void
+n00b_gc_run_finalizers(void)
+{
+    if (!n00b_default_runtime_is_set()) {
+        return;
+    }
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (rt == nullptr || n00b_atomic_load(&rt->pending_finalizers_len) == 0
+        || n00b_atomic_load(&rt->stw_active)) {
+        return;
+    }
+
+    bool expected = false;
+    if (!n00b_atomic_cas(&rt->finalizer_drain_active, &expected, true)) {
+        return;
+    }
+
+    while (true) {
+        n00b_finalizer_t fn   = nullptr;
+        void            *user = nullptr;
+
+        // The gate keeps a collection from growing or rewriting the queue
+        // while an entry is taken off it.
+        n00b_rw_read_lock(&rt->critical_execution);
+        uint32_t len = n00b_atomic_load(&rt->pending_finalizers_len);
+        if (len != 0) {
+            n00b_finalizer_info_t *e = &rt->pending_finalizers[len - 1];
+            fn                       = e->funcptr;
+            user                     = e->user_ptr;
+            *e                       = (n00b_finalizer_info_t){};
+            n00b_atomic_store(&rt->pending_finalizers_len, len - 1);
+        }
+        n00b_rw_unlock(&rt->critical_execution);
+
+        if (fn == nullptr) {
+            break;
+        }
+        fn(user);
+    }
+
+    n00b_atomic_store(&rt->finalizer_drain_active, false);
 }
 
 // ============================================================================
@@ -3575,11 +3820,15 @@ static void
 n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_memory)
 {
     ctx->from_space = from_space;
+    // The to-space is sized from the arena's allocation count.
+    n00b_gc_settle_tlabs(from_space, false);
     ctx->to_space   = n00b_create_destination_arena(from_space, out_of_memory);
     ctx->pin_all    = n00b_gc_pin_all_policy();
     // The context is an uninitialized stack struct; every field is assigned
     // here by hand.
     ctx->to_space_max_alloc_len = 0;
+    ctx->segment_lookups        = 0;
+    ctx->segment_lookup_steps   = 0;
 
     /* Bump the runtime's GC epoch counter and snapshot it onto the
      * collection context. The mark phase stamps this value onto
@@ -3803,6 +4052,8 @@ n00b_reclaim_pinned_pages(n00b_collect_t *ctx, n00b_segment_t *from_chain)
     n00b_atomic_store(&n00b_gc_last_freed_pages, freed_pages);
     n00b_atomic_store(&n00b_gc_last_retained_runs, retained_runs);
     n00b_atomic_store(&n00b_gc_last_nobitmap_segs, nobitmap_segs);
+    n00b_atomic_store(&n00b_gc_last_segment_lookups, ctx->segment_lookups);
+    n00b_atomic_store(&n00b_gc_last_segment_lookup_steps, ctx->segment_lookup_steps);
     n00b_atomic_add(&n00b_gc_total_pinned_pages, pinned_pages);
     n00b_atomic_add(&n00b_gc_total_freed_pages, freed_pages);
     n00b_atomic_add(&n00b_gc_collect_count, 1);
@@ -3811,6 +4062,75 @@ n00b_reclaim_pinned_pages(n00b_collect_t *ctx, n00b_segment_t *from_chain)
 // ============================================================================
 // Collection cleanup — swap segments and destroy temporaries
 // ============================================================================
+
+// Every thread's allocation buffer for the default arena: add the objects it
+// handed out since the last settle to the arena's count and, when `retire`,
+// drop the buffer, whose space is in the from-space this collection reclaims.
+// Exited threads settled their own count in n00b_thread_destroy.
+static void
+n00b_gc_settle_tlabs(n00b_arena_t *arena, bool retire)
+{
+    n00b_runtime_t *rt = n00b_get_runtime();
+    if (arena != rt->default_arena) {
+        return;
+    }
+    for (uint32_t i = 0; i < rt->max_threads; i++) {
+        n00b_thread_t *t = (n00b_thread_t *)n00b_atomic_load(&rt->threads[i].thread);
+        if (n00b_thread_slot_is_vacant(t)) {
+            continue;
+        }
+        uint64_t unseen = t->tlab_allocs - t->tlab_allocs_seen;
+        if (unseen != 0) {
+            n00b_atomic_add(&arena->alloc_count, (uint32_t)unseen);
+            t->tlab_allocs_seen = t->tlab_allocs;
+        }
+        if (retire) {
+            atomic_store_explicit(&t->tlab_end, nullptr, memory_order_relaxed);
+            atomic_store_explicit(&t->tlab_cur, nullptr, memory_order_relaxed);
+            t->tlab_noted_len = 0;
+        }
+    }
+}
+
+#if defined(N00B_DEBUG)
+// Every allocation from an arena with OOB metadata inserts one record, so the
+// records inserted since alloc_count was last zeroed must match it. A thread
+// stopped between counting an allocation and inserting its record skews the
+// two by one, in either direction across a collection, so each live thread
+// allows one.
+static void
+n00b_gc_check_alloc_count(n00b_arena_t *arena)
+{
+    _n00b_dict_internal_t *md = arena->vtable.metadata;
+    if (md == nullptr || arena->md_inserts_unknown) {
+        return;
+    }
+
+    n00b_runtime_t *rt      = n00b_get_runtime();
+    int64_t         threads = 0;
+    for (uint32_t i = 0; i < rt->max_threads; i++) {
+        n00b_thread_t *t = (n00b_thread_t *)n00b_atomic_load(&rt->threads[i].thread);
+        if (!n00b_thread_slot_is_vacant(t)) {
+            threads++;
+        }
+    }
+
+    uint32_t inserted = n00b_atomic_load(&md->insertion_epoch) - arena->md_inserts_at_zero;
+    uint32_t counted  = n00b_atomic_load(&arena->alloc_count);
+    int64_t  skew     = (int64_t)counted - (int64_t)inserted;
+
+    if (skew > threads || skew < -threads) {
+        fprintf(stderr,
+                "n00b: arena %s counted %u allocations since its last collection "
+                "but inserted %u metadata records (%lld threads)\n",
+                arena->vtable.debug_name ? arena->vtable.debug_name : "?",
+                counted,
+                inserted,
+                (long long)threads);
+        n00b_require(false, "alloc_count disagrees with the arena's metadata records");
+    }
+}
+#endif
 
 static void
 n00b_collection_cleanup(n00b_collect_t *ctx)
@@ -3824,6 +4144,7 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
     ctx->from_space->current_segment = new_segment;
     ctx->from_space->next_alloc      = ctx->to_space->next_alloc;
     ctx->from_space->segment_end     = ctx->to_space->segment_end;
+    n00b_gc_settle_tlabs(ctx->from_space, true);
 
     n00b_gc_shrink_primary_segment(ctx->from_space);
 
@@ -3858,6 +4179,9 @@ n00b_collection_cleanup(n00b_collect_t *ctx)
 
         ctx->from_space->vtable.metadata      = ctx->to_space->vtable.metadata;
         ctx->from_space->vtable.metadata_pool = ctx->to_space->vtable.metadata_pool;
+        ctx->from_space->md_inserts_at_zero
+            = n00b_atomic_load(&ctx->from_space->vtable.metadata->insertion_epoch);
+        ctx->from_space->md_inserts_unknown = false;
         // to-space no longer owns them, so its destroy below leaves them alone.
         ctx->to_space->vtable.metadata      = nullptr;
         ctx->to_space->vtable.metadata_pool = nullptr;
@@ -4043,6 +4367,9 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
     segment->last_addr = n00b_atomic_load(&arena->next_alloc);
 
     n00b_collect_setup(&ctx, arena, out_of_memory);
+#if defined(N00B_DEBUG)
+    n00b_gc_check_alloc_count(arena);
+#endif
     arena->alloc_count = 0;
 #if defined(N00B_CENSUS_ENABLED)
     if (timing_census != nullptr) {
@@ -4139,6 +4466,14 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
 
     assert(!n00b_list_len(ctx.worklist));
 
+    // Finalizable objects the mark did not reach are resurrected here, so the
+    // census and the pool sweep below see them as live.
+    n00b_process_finalizers(&ctx);
+    n00b_debug_census_finish_phase(timing_census == nullptr ? nullptr
+                                                            : &timing_census->gc_finalizers_ns,
+                                   &phase_start_ns);
+    assert(!n00b_list_len(ctx.worklist));
+
     /* Pool census: must run HERE — after the mark (so gc_epoch
      * distinguishes reachable=current from leaked=stale) but BEFORE the
      * sweep below, which stamps leaked allocs with the current epoch and
@@ -4185,11 +4520,6 @@ n00b_collect_internal(n00b_arena_t *arena, bool out_of_memory)
     n00b_debug_census_finish_phase(
         timing_census == nullptr ? nullptr : &timing_census->gc_foreign_reap_ns,
         &phase_start_ns);
-
-    n00b_process_finalizers(&ctx);
-    n00b_debug_census_finish_phase(timing_census == nullptr ? nullptr
-                                                            : &timing_census->gc_finalizers_ns,
-                                   &phase_start_ns);
 
 #if defined(N00B_CENSUS_ENABLED)
     g_site_census = nullptr;
@@ -4347,6 +4677,9 @@ n00b_collect(n00b_arena_t *arena) _kargs
         n00b_atomic_store(&g_debug_census_active, false);
     }
 #endif
+
+    // A no-op while a caller's own stop-the-world is still in force.
+    n00b_gc_run_finalizers();
 }
 
 #if defined(N00B_CENSUS_ENABLED)

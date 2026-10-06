@@ -187,7 +187,7 @@ get_node_type(n00b_annot_result_t *annot, n00b_parse_tree_t *node)
     }
 
     bool      found = false;
-    uintptr_t key   = (uintptr_t)node;
+    n00b_parse_tree_t *key = node;
     n00b_tc_type_t *t = n00b_dict_get(annot->node_types, key, &found);
 
     return found ? t : NULL;

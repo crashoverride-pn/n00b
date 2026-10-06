@@ -131,6 +131,19 @@ n00b_collect(n00b_arena_t *arena) _kargs
 };
 
 /**
+ * @brief Run the finalizers of objects earlier collections found unreachable.
+ *
+ * A collection does not run finalizers with the world stopped. It keeps each
+ * unreachable finalizable object (and what its finalizer data references)
+ * alive and queues the finalizer; the queue runs here, on the calling thread.
+ * n00b_collect calls this itself once the world is running again, and an
+ * allocation whose own out-of-memory collect queued finalizers runs them
+ * before it returns. Returns at once while the world is stopped or another
+ * thread is already draining the queue.
+ */
+extern void n00b_gc_run_finalizers(void);
+
+/**
  * @brief Stop-the-world GC pass with leak-detection diagnostics
  *        enabled.
  *
@@ -347,6 +360,11 @@ typedef struct {
      * after every collect and the guard scan would fall back to the global
      * all-time high-water mark. */
     uint64_t                          to_space_max_alloc_len;
+    /* From-space segment lookups made by the pin and finalizer paths this
+     * collect, and the scan-tree nodes they visited. Published at cleanup as
+     * n00b_gc_last_segment_lookups / n00b_gc_last_segment_lookup_steps. */
+    uint64_t                          segment_lookups;
+    uint64_t                          segment_lookup_steps;
 } n00b_collect_t;
 
 // ============================================================================

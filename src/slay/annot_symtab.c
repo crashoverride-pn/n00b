@@ -585,8 +585,7 @@ annot_phase_symtab(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
                 // Set the node's type to the structural type so that
                 // @assigns unification propagates it to the variable.
                 if (ctx->node_types) {
-                    uintptr_t key = (uintptr_t)nc->node;
-                    n00b_dict_put(ctx->node_types, key, nc->last_sym->type_var);
+                    n00b_dict_put(ctx->node_types, nc->node, nc->last_sym->type_var);
                 }
 
                 // Create a scope for the fields.
@@ -751,8 +750,7 @@ annot_phase_symtab(n00b_annot_walk_ctx_t *ctx, annot_node_ctx_t *nc)
             }
 
             if (lit_type && ctx->node_types) {
-                uintptr_t key = (uintptr_t)nc->node;
-                n00b_dict_put(ctx->node_types, key, lit_type);
+                n00b_dict_put(ctx->node_types, nc->node, lit_type);
             }
 
             break;

@@ -843,3 +843,10 @@ extern uint64_t n00b_cg_val_get_type_hash(n00b_cg_session_t *session,
 // ============================================================================
 
 void n00b_cg_session_dump(n00b_cg_session_t *session, FILE *out);
+
+#if defined(N00B_DEBUG)
+// The field-lock table that compiled code reaches through the
+// n00b_builtin_field_set_and_lock and n00b_builtin_field_set imports.
+extern void n00b_cg_debug_lock_field(void *obj, int64_t offset);
+extern bool n00b_cg_debug_field_is_locked(void *obj, int64_t offset);
+#endif

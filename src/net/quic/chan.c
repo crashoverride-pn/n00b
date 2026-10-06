@@ -77,17 +77,6 @@ chan_metrics_on_close(n00b_quic_chan_t *chan)
         .label_values = lv);
 }
 
-/* GC-time finalizer for channels.  Idempotent against
- * `n00b_quic_chan_close`.  Safe even if the owning conn / endpoint
- * has already been finalized — `n00b_quic_chan_close` checks
- * `chan->conn->cnx` and `chan->conn->closed` before touching
- * picoquic. */
-void
-_n00b_quic_chan_finalize(void *p)
-{
-    n00b_quic_chan_close((n00b_quic_chan_t *)p);
-}
-
 /* ===========================================================================
  * Open
  * =========================================================================== */
@@ -121,13 +110,8 @@ n00b_quic_chan_open(n00b_quic_conn_t *conn) _kargs
     n00b_allocator_t *alloc =
         (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
-    extern void _n00b_quic_chan_finalize(void *p);
-
     n00b_quic_chan_t *chan = n00b_alloc_with_opts(n00b_quic_chan_t,
-                                &(n00b_alloc_opts_t){
-                                    .allocator = alloc,
-                                    .finalizer = _n00b_quic_chan_finalize,
-                                });
+                                &(n00b_alloc_opts_t){.allocator = alloc});
 
     chan->conn         = conn;
     chan->next_in_conn = nullptr;
@@ -298,13 +282,8 @@ _n00b_quic_chan_accept_internal(n00b_quic_conn_t *conn, uint64_t stream_id)
     n00b_allocator_t *alloc =
         (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
 
-    extern void _n00b_quic_chan_finalize(void *p);
-
     n00b_quic_chan_t *chan = n00b_alloc_with_opts(n00b_quic_chan_t,
-                                &(n00b_alloc_opts_t){
-                                    .allocator = alloc,
-                                    .finalizer = _n00b_quic_chan_finalize,
-                                });
+                                &(n00b_alloc_opts_t){.allocator = alloc});
 
     /* RFC 9000 §2.1: stream-ID bit 1 distinguishes uni (1) from bidi
      * (0).  Bit 0 distinguishes server-initiated (1) from
