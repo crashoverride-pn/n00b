@@ -218,9 +218,12 @@ _n00b_result_error_from_payload(uint64_t payload_type, void *payload)
  * @brief Wrap an mmap() call — returns MAP_FAILED on error.
  * Usage: n00b_result_t(void *) r = n00b_check_mmap(nullptr, sz, ...);
  */
-// Diagnostic probe: logs every mapping of 32 MiB or more with its call site.
+// Diagnostic probe: logs every mapping of 32 MiB or more with its call site,
+// and counts every mapping. Silent unless N00B_PROBE is set when n00b_init runs.
 #define N00B_PROBE_MIN_BYTES (32ull << 20)
+extern void n00b_probe_init(void);
 extern void n00b_probe_log(const char *fmt, ...);
+extern void n00b_probe_count_stack(unsigned long long sz);
 extern void n00b_probe_bigmap(unsigned long long sz,
                               const char        *what,
                               const char        *file,

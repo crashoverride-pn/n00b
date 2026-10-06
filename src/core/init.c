@@ -378,6 +378,8 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
         return;
     }
 
+    n00b_probe_init();
+
 #ifdef _WIN32
     n00b_page_size = base_page_size();
 #else

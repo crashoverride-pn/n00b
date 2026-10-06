@@ -23,14 +23,36 @@
 #include <io.h>
 #endif
 
-// Diagnostic probe. Every line goes to fd 2 with a single write: no stdio lock,
-// so it is safe inside a stop-the-world collect. waxd's Windows service mode
-// points fd 2 at its log file. Timestamps are wall-clock milliseconds, to line
-// up with an external sampler.
+// Diagnostic probe, off unless N00B_PROBE is set to anything but "" or "0".
+//
+// The variable is read once, from n00b_init on the main thread: a getenv on a
+// raw-clone worker or inside a stop-the-world collect is not safe.
+//
+// Every line goes to fd 2 with a single write, so no stdio lock is taken inside
+// a collect; waxd's Windows service mode points fd 2 at its log file. Each line
+// carries wall-clock milliseconds and the running mapping totals, so the delta
+// between any two lines is what was mapped in between, including mappings too
+// small to log on their own.
+static _Atomic bool               probe_enabled;
+static _Atomic(unsigned long long) probe_map_bytes;
+static _Atomic(unsigned long long) probe_map_calls;
+static _Atomic(unsigned long long) probe_unmap_bytes;
+static _Atomic(unsigned long long) probe_stack_bytes;
+
+void
+n00b_probe_init(void)
+{
+    const char *v = getenv("N00B_PROBE");
+    atomic_store(&probe_enabled, v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0);
+}
+
 void
 n00b_probe_log(const char *fmt, ...)
 {
-    char buf[512];
+    if (!atomic_load_explicit(&probe_enabled, memory_order_relaxed)) {
+        return;
+    }
+    char buf[640];
     int  n = snprintf(buf,
                       sizeof(buf),
                       "N00BPROBE wall_ms=%lld ",
@@ -39,6 +61,15 @@ n00b_probe_log(const char *fmt, ...)
     va_start(ap, fmt);
     n += vsnprintf(buf + n, sizeof(buf) - (size_t)n, fmt, ap);
     va_end(ap);
+    if (n < (int)sizeof(buf)) {
+        n += snprintf(buf + n,
+                      sizeof(buf) - (size_t)n,
+                      " | map_bytes=%llu map_calls=%llu unmap_bytes=%llu stack_bytes=%llu",
+                      atomic_load(&probe_map_bytes),
+                      atomic_load(&probe_map_calls),
+                      atomic_load(&probe_unmap_bytes),
+                      atomic_load(&probe_stack_bytes));
+    }
     if (n > (int)sizeof(buf) - 2) {
         n = (int)sizeof(buf) - 2;
     }
@@ -50,16 +81,38 @@ n00b_probe_log(const char *fmt, ...)
 #endif
 }
 
+// Called for every mapping and unmapping, whatever its size. Mappings below the
+// log threshold are only counted, but each GiB of cumulative mapping emits a
+// GIB line, so a storm of small mappings still shows up in the log.
 void
 n00b_probe_bigmap(unsigned long long sz,
                   const char        *what,
                   const char        *file,
                   int                line)
 {
+    if (what[0] == 'U') {
+        atomic_fetch_add(&probe_unmap_bytes, sz);
+    }
+    else {
+        unsigned long long prev = atomic_fetch_add(&probe_map_bytes, sz);
+        atomic_fetch_add(&probe_map_calls, 1);
+        if ((prev >> 30) != ((prev + sz) >> 30) && sz < N00B_PROBE_MIN_BYTES) {
+            n00b_probe_log("GIB site=%s:%d", file, line);
+        }
+    }
     if (sz < N00B_PROBE_MIN_BYTES) {
         return;
     }
     n00b_probe_log("%s sz=%llu site=%s:%d", what, sz, file, line);
+}
+
+// Windows thread-stack regions are committed by a direct VirtualAlloc that
+// bypasses n00b_check_mmap.
+void
+n00b_probe_count_stack(unsigned long long sz)
+{
+    atomic_fetch_add(&probe_stack_bytes, sz);
+    n00b_probe_log("CALLSTACK sz=%llu", sz);
 }
 
 // Raw munmap/VirtualFree failures from n00b_safe_munmap (declared in mmaps.h).
