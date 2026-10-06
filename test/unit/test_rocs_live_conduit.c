@@ -20,6 +20,7 @@
 #endif
 
 #include <rocs/n00b_rocs.h>
+#include "internal/rocs/eval.h"
 #include "internal/rocs/index.h"
 #include "internal/rocs/query.h"
 #include "internal/rocs/store.h"
@@ -817,6 +818,201 @@ test_output_start_close_joins_thread(void)
     }
 }
 
+static void
+idle_for_ms(n00b_query_hit_inbox_t *inbox, int64_t ms)
+{
+    int64_t deadline_ms = now_ms() + ms;
+    for (int64_t remain = ms; remain > 0; remain = deadline_ms - now_ms()) {
+        n00b_condition_lock(&inbox->cv);
+        n00b_condition_wait(&inbox->cv,
+                            .timeout_ms  = remain,
+                            .auto_unlock = true);
+    }
+}
+
+// A hang detector: returns as soon as the output has emitted `emitted`
+// positions, and fails only after a bound no working box comes near.
+static void
+wait_for_emitted_or_hang(n00b_query_view_t      *view,
+                         n00b_query_hit_inbox_t *inbox,
+                         uint64_t                emitted)
+{
+    int64_t deadline_ms = now_ms() + 120000;
+    while (true) {
+        auto stats_r = n00b_query_output_stats(view);
+        CHECK(n00b_result_is_ok(stats_r));
+        if (n00b_result_get(stats_r).emitted_positions >= emitted) {
+            return;
+        }
+        CHECK(now_ms() < deadline_ms);
+        idle_for_ms(inbox, 5);
+    }
+}
+
+static uint64_t
+tail_scans(n00b_query_view_t *view)
+{
+    auto stats_r = n00b_query_live_tail_stats(view);
+    CHECK(n00b_result_is_ok(stats_r));
+    return n00b_result_get(stats_r).scans;
+}
+
+// With a commit inbox, an idle output view sleeps until a commit arrives or
+// its one-second idle bound passes, and a commit still wakes it.
+static void
+test_idle_output_waits_for_a_commit(void)
+{
+    live_output_ctx_t ctx = new_live_output_ctx(9510);
+    (void)ingest_and_seal(ctx.store, 90, r"error", 5901);
+
+    n00b_query_view_t      *view  = live_output_view_ok(&ctx);
+    n00b_query_hit_topic_t *topic = output_topic_ok(view);
+    n00b_query_hit_inbox_t *inbox = output_inbox_ok(&ctx);
+    (void)subscribe_ok(topic, inbox);
+    start_output_true(view);
+
+    wait_for_emitted_or_hang(view, inbox, 1);
+    // A hang detector: the loop scans once after publishing history.
+    int64_t deadline_ms = now_ms() + 120000;
+    while (tail_scans(view) == 0 && now_ms() < deadline_ms) {
+        idle_for_ms(inbox, 5);
+    }
+    uint64_t settled = tail_scans(view);
+    CHECK(settled >= 1);
+
+    // Long enough for a 100ms timer to have fired several times. The bound is
+    // relative to the time that passed, so a slow box is allowed more scans.
+    int64_t idle_start = now_ms();
+    idle_for_ms(inbox, 500);
+    uint64_t idle_ms = (uint64_t)(now_ms() - idle_start);
+    CHECK(tail_scans(view) - settled <= idle_ms / 1000 + 1);
+
+    ingest_hot(ctx.store, 91, r"error");
+    wait_for_emitted_or_hang(view, inbox, 2);
+    CHECK(tail_scans(view) > settled);
+
+    close_view_true(view);
+    drain_ok(inbox);
+    destroy_live_output_ctx(&ctx);
+}
+
+// With the store's commit topic gone, the view's inbox hears no commit, and the
+// output view finds new records when its idle bound passes.
+static void
+test_output_polls_once_commits_stop_arriving(void)
+{
+    live_output_ctx_t ctx = new_live_output_ctx(9511);
+    (void)ingest_and_seal(ctx.store, 92, r"error", 5911);
+
+    n00b_query_view_t      *view  = live_output_view_ok(&ctx);
+    n00b_query_hit_topic_t *topic = output_topic_ok(view);
+    n00b_query_hit_inbox_t *inbox = output_inbox_ok(&ctx);
+    (void)subscribe_ok(topic, inbox);
+    start_output_true(view);
+    wait_for_emitted_or_hang(view, inbox, 1);
+
+    CHECK(n00b_result_is_ok(n00b_store_set_commit_topic(ctx.store, nullptr)));
+    ingest_hot(ctx.store, 93, r"error");
+    wait_for_emitted_or_hang(view, inbox, 2);
+
+    close_view_true(view);
+    drain_ok(inbox);
+    destroy_live_output_ctx(&ctx);
+}
+
+static uint64_t
+resident_acquires(n00b_store_t *store)
+{
+    auto stats_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(stats_r));
+    n00b_store_memory_stats_t stats = n00b_result_get(stats_r);
+    return stats.resident_cache_hits + stats.resident_cache_misses;
+}
+
+// A subscriber whose DROP_NEWEST inbox is full is skipped before a hit is
+// built for it, so a dropped message costs no resident. History reads only
+// positions, so it acquires one per boundary, to plan it, and the one
+// delivered message pins one more.
+static void
+test_full_inbox_drops_without_materializing(void)
+{
+    live_output_ctx_t ctx = new_live_output_ctx(9512);
+    for (int64_t i = 0; i < 3; i++) {
+        (void)ingest_and_seal(ctx.store, 94 + i, r"error", (uint64_t)(5920 + i));
+    }
+
+    n00b_query_view_t      *view  = live_output_view_ok(&ctx);
+    n00b_query_hit_topic_t *topic = output_topic_ok(view);
+    n00b_query_hit_inbox_t *inbox =
+        output_inbox_ok(&ctx,
+                        .backpressure = N00B_CONDUIT_BP_DROP_NEWEST,
+                        .limit        = 1);
+    (void)subscribe_ok(topic, inbox);
+
+    uint64_t before = resident_acquires(ctx.store);
+    start_output_true(view);
+    wait_for_emitted_or_hang(view, inbox, 3);
+
+    auto stats_r = n00b_query_output_stats(view);
+    CHECK(n00b_result_is_ok(stats_r));
+    CHECK(n00b_result_get(stats_r).dropped_messages == 2);
+    CHECK(resident_acquires(ctx.store) - before == 3 + 1);
+
+    close_view_true(view);
+    drain_ok(inbox);
+    destroy_live_output_ctx(&ctx);
+}
+
+// An output view publishes history from the view's own boundaries, so shards
+// below its seal floor are never read. Those ten shards hold fifty matches
+// each; the ten inside the window hold one record each, and only the last
+// matches.
+static void
+test_output_history_reads_only_the_view_window(void)
+{
+    live_output_ctx_t ctx = new_live_output_ctx(9513);
+    int64_t           id  = 0;
+    for (uint64_t shard = 0; shard < 10; shard++) {
+        for (int i = 0; i < 50; i++) {
+            ingest_hot(ctx.store, id++, r"error");
+        }
+        (void)seal_current(ctx.store, 6000 + shard);
+    }
+    for (uint64_t shard = 0; shard < 10; shard++) {
+        ingest_hot(ctx.store, id++, shard == 9 ? r"error" : r"info");
+        (void)seal_current(ctx.store, 7000 + shard);
+    }
+
+    auto view_r = n00b_query_view(ctx.store,
+                                  ctx.filter,
+                                  .mode           = N00B_QUERY_MODE_LIVE,
+                                  .out            = ctx.conduit,
+                                  .min_seal_ts_ns = 7000);
+    CHECK(n00b_result_is_ok(view_r));
+    n00b_query_view_t      *view  = n00b_result_get(view_r);
+    n00b_query_hit_topic_t *topic = output_topic_ok(view);
+    n00b_query_hit_inbox_t *inbox = output_inbox_ok(&ctx);
+    (void)subscribe_ok(topic, inbox);
+
+#ifdef N00B_DEBUG
+    n00b_plan_records_scanned_reset();
+#endif
+    start_output_true(view);
+    wait_for_emitted_or_hang(view, inbox, 1);
+#ifdef N00B_DEBUG
+    uint64_t scanned = n00b_plan_records_scanned();
+    n00b_printf("  output history over a 10-shard window of 20 shards: "
+                "records evaluated «#»",
+                (int64_t)scanned);
+    // Reading any one shard below the floor would cost fifty.
+    CHECK(scanned < 50);
+#endif
+
+    close_view_true(view);
+    drain_ok(inbox);
+    destroy_live_output_ctx(&ctx);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -832,6 +1028,10 @@ main(int argc, char **argv)
     test_unsubscribe_close_and_snapshot_out();
     test_output_view_pin_blocks_retention_until_close();
     test_output_start_close_joins_thread();
+    test_idle_output_waits_for_a_commit();
+    test_output_polls_once_commits_stop_arriving();
+    test_full_inbox_drops_without_materializing();
+    test_output_history_reads_only_the_view_window();
 
     n00b_print(r"rocs_live_conduit: ok");
     n00b_shutdown();

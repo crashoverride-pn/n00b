@@ -396,6 +396,20 @@ n00b_query_cursor_live_is_waiting(n00b_query_cursor_t *cursor);
 extern n00b_result_t(bool)
 n00b_query_cursor_live_wait_until_waiting(n00b_query_cursor_t *cursor);
 
+#ifdef N00B_DEBUG
+/**
+ * @brief Records the query layer has read since the last reset: each record
+ *        view or hot-record copy built to deliver a hit, whether a cursor hit,
+ *        a result-owned hit, or a linear-cursor step. Record scans inside
+ *        planning are counted by n00b_plan_records_scanned instead.
+ */
+extern uint64_t
+n00b_query_records_read(void);
+
+extern void
+n00b_query_records_read_reset(void);
+#endif
+
 /**
  * @brief Return read-only counters for the invisible process-side cache.
  *
@@ -423,15 +437,18 @@ extern n00b_result_t(bool)
 n00b_query_cache_clear(n00b_query_view_t *view);
 
 /**
- * @brief Enable or disable cache lookup/population for focused tests.
+ * @brief Enable or disable cache lookup/population for a view.
  *
  * @param view Borrowed query view.
- * @param disabled If true, cursor construction bypasses the cache and runs the
- *                 existing planner path.
+ * @param disabled If true, cursors plan every boundary themselves. A view's
+ *                 cache starts disabled, so this is how a caller that runs
+ *                 several cursors over one view opts in.
  * @return Ok(true), or @c N00B_QUERY_ERR_ARG for null input.
  *
- * This is an internal/test control only. It is not public API and must not be
- * used as a query feature knob.
+ * An enabled cache holds at most 64 entries unless
+ * @ref n00b_query_cache_set_max_entries says otherwise. A cursor planning
+ * through the cache plans each boundary whole, since a cached set must answer
+ * any later cursor, so it gives up the view limit's early stop.
  */
 extern n00b_result_t(bool)
 n00b_query_cache_set_disabled(n00b_query_view_t *view, bool disabled);
@@ -440,8 +457,8 @@ n00b_query_cache_set_disabled(n00b_query_view_t *view, bool disabled);
  * @brief Set the internal FIFO cache-entry bound for a query view.
  *
  * @param view Borrowed query view.
- * @param max_entries Maximum retained cache entries. Zero keeps the cache
- *                    unbounded, which is the default Phase 3 behavior.
+ * @param max_entries Maximum retained cache entries, 64 by default. Zero
+ *                    removes the bound.
  * @return Ok(true), or @c N00B_QUERY_ERR_ARG for null input.
  *
  * Positive bounds retain at most @p max_entries cache ownership references.

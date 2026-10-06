@@ -2418,6 +2418,16 @@ rocs_query_topn_test = executable('test_rocs_query_topn',
 )
 test('rocs_query_topn', rocs_query_topn_test, suite: 'unit')
 
+rocs_query_scaling_test = executable('test_rocs_query_scaling',
+    ['test/unit/test_rocs_query_scaling.c'],
+    kwargs: test_common_kwargs,
+)
+# Builds and walks stores of tens of thousands of records, which needs more
+# than meson's 30s default under parallel CI load. Same bound as the
+# seal-heavy tests (rocs_seal_bench, rocs_term_summary, rocs_catalog_index).
+test('rocs_query_scaling', rocs_query_scaling_test, suite: 'unit',
+     timeout: 180)
+
 rocs_query_view_test = executable('test_rocs_query_view',
     ['test/unit/test_rocs_query_view.c'],
     kwargs: test_common_kwargs,

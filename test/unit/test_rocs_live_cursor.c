@@ -567,6 +567,113 @@ test_snapshot_cursor_regression(void)
     destroy_live_cursor_ctx(&ctx);
 }
 
+// Lets the test reach the inbox the live view subscribed to the commit topic.
+N00B_CONDUIT_SUBSCRIPTION_IMPL(n00b_store_commit_t);
+N00B_CONDUIT_TOPIC_IMPL(n00b_store_commit_t);
+
+typedef struct {
+    n00b_query_cursor_t *cursor;
+    n00b_condition_t     done_cv;
+    _Atomic(bool)        done;
+    n00b_result_t(n00b_option_t(n00b_query_hit_t *)) result;
+} signaling_worker_t;
+
+static void *
+signaling_worker_main(void *arg)
+{
+    signaling_worker_t *worker = (signaling_worker_t *)arg;
+    worker->result = n00b_query_cursor_next(worker->cursor);
+    n00b_atomic_store(&worker->done, true);
+    n00b_condition_notify(&worker->done_cv, .all = true, .auto_unlock = true);
+    return worker;
+}
+
+static int64_t
+now_ms(void)
+{
+    return (int64_t)(n00b_ns_timestamp() / N00B_NS_PER_MS);
+}
+
+// A hang detector: true as soon as the worker returns, false only after a
+// bound no working box comes near.
+static bool
+signaling_worker_returns(signaling_worker_t *worker)
+{
+    int64_t deadline_ms = now_ms() + 60000;
+    while (!n00b_atomic_load(&worker->done)) {
+        int64_t remain_ms = deadline_ms - now_ms();
+        if (remain_ms <= 0) {
+            return false;
+        }
+        n00b_condition_lock(&worker->done_cv);
+        if (!n00b_atomic_load(&worker->done)) {
+            n00b_condition_wait(&worker->done_cv,
+                                .timeout_ms  = remain_ms < 100 ? remain_ms : 100,
+                                .auto_unlock = true);
+        }
+        else {
+            n00b_condition_unlock(&worker->done_cv);
+        }
+    }
+    return true;
+}
+
+// Another consumer's scan can take a commit's wakeup and append its position
+// after a cursor last looked and before it waits on the commit inbox. The
+// cursor sees the position ahead of it and returns it rather than sleeping
+// until some later commit.
+static void
+test_waiting_cursor_takes_positions_another_scan_appended(void)
+{
+    live_cursor_ctx_t    ctx    = new_live_cursor_ctx(9216);
+    n00b_query_view_t   *view   = live_view(&ctx);
+    n00b_query_cursor_t *cursor = cursor_ok(view);
+
+    CHECK(n00b_list_len(ctx.topic->subscriptions) == 1);
+    n00b_store_commit_inbox_t *inbox =
+        n00b_list_get(ctx.topic->subscriptions, 0)->inbox;
+    CHECK(inbox != nullptr);
+
+    signaling_worker_t *worker = n00b_alloc(signaling_worker_t);
+    worker->cursor = cursor;
+    n00b_condition_init(&worker->done_cv);
+
+    // Holding the inbox lock stops the worker after it has found nothing to
+    // deliver and before it checks the inbox.
+    n00b_condition_lock(&inbox->cv);
+    auto thread_r = n00b_thread_spawn(signaling_worker_main, worker);
+    CHECK(n00b_result_is_ok(thread_r));
+    wait_until_cursor_blocked(cursor);
+
+    // The commit lands in the inbox without a notify, which would release the
+    // lock this thread holds.
+    n00b_conduit_inbox_set_no_notify(inbox, true);
+    ingest_hot(ctx.store, 50, r"error");
+    n00b_conduit_inbox_set_no_notify(inbox, false);
+    n00b_store_pos_t live_pos = hot_pos_after_ingest(ctx.store);
+    CHECK(n00b_store_commit_inbox_has_messages(inbox));
+
+    // This scan drains the wakeup, appends the position, and notifies, which
+    // releases the inbox lock before the worker waits.
+    auto scan_r = n00b_query_live_tail_scan_once(view);
+    CHECK(n00b_result_is_ok(scan_r));
+    CHECK(n00b_result_get(scan_r) == 1);
+    (void)n00b_condition_unlock(&inbox->cv);
+
+    bool returned = signaling_worker_returns(worker);
+    if (!returned) {
+        close_cursor_true(cursor);
+    }
+    CHECK(n00b_thread_join(n00b_result_get(thread_r)) == worker);
+    CHECK(returned);
+    CHECK(n00b_result_is_ok(worker->result));
+    check_hit_option(n00b_result_get(worker->result), live_pos, 50);
+
+    close_cursor_true(cursor);
+    close_view_true(view);
+    destroy_live_cursor_ctx(&ctx);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -582,6 +689,7 @@ main(int argc, char **argv)
     test_limit_spans_historical_and_live_hits();
     test_delivered_hot_live_hit_survives_shard_seal_until_advance();
     test_snapshot_cursor_regression();
+    test_waiting_cursor_takes_positions_another_scan_appended();
 
     n00b_shutdown();
     return 0;

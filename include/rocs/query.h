@@ -504,34 +504,36 @@ n00b_query_hit_inbox_drain(n00b_query_hit_inbox_t *inbox);
  *         snapshot boundary shard is no longer retained and the store reports
  *         an oldest-available boundary.
  *
- * @post Cursor construction validates every copied snapshot boundary entry
- *       against the current store catalog before planning. Missing,
- *       retained-away, stale-generation, stale-schema, and incompatible
- *       metadata states fail with typed query results and release any resident
- *       handles acquired during construction.
+ * @post Live cursor construction lowers the filter, builds a plan from it,
+ *       and checks that every copied snapshot boundary shard is still in the
+ *       store catalog, so lowering, planner, and retention failures come from
+ *       this call. A retained-away shard fails with the retention payload.
+ *       Stale-generation, stale-schema, and incompatible metadata surface when
+ *       that boundary is read, on either kind of cursor.
  * @post Planning lowers the public filter through
- *       @c n00b_filter_lower_to_plan, plans sealed shards through
- *       @c n00b_plan_store_sealed, and intersects planner output with the
- *       copied snapshot boundary before constructing hits. Later commits after
- *       view creation are therefore excluded even if the planner sees them in
- *       the current catalog.
+ *       @c n00b_filter_lower_to_plan and plans each copied snapshot boundary's
+ *       shard on its own, one boundary at a time as the cursor advances.
+ *       Later commits after view creation are therefore excluded even if they
+ *       are in the current catalog.
  * @post A view-owned, process-side cache may store copied per-shard ordinal
  *       sets for cacheable public filter shapes. Cache hits never expose
  *       resident handles, mapped shard internals, record views, raw mapped
  *       containers, or public hit handles, and cursor windowing is applied
  *       after cache lookup.
  * @post Snapshot cursor hits are emitted in increasing durable
- *       @c (generation, shard_id, ordinal) order. Live cursor construction
- *       builds the same historical prefix, then later @ref
- *       n00b_query_cursor_next calls scan committed store state after the
- *       captured cutover. Records committed during cursor construction or
+ *       @c (generation, shard_id, ordinal) order. A live cursor delivers the
+ *       same historical prefix, one hit at a time as a snapshot cursor does,
+ *       then scans committed store state after the captured cutover. Records
+ *       committed during cursor construction or
  *       historical delivery are discovered by that live scan with no
  *       history/live duplicate by durable position. @c resume is enforced as
  *       strictly after the supplied position, @c as_of includes the supplied
  *       position and excludes later positions, and @c limit == 0 means
  *       unlimited.
  * @post Cursor-held resident shard handles pin mapped images until
- *       @ref n00b_query_cursor_close or view close. Returned hit and record
+ *       @ref n00b_query_cursor_close or view close; a live cursor releases
+ *       them, with its delivered hits' records, once it has handed out every
+ *       hit it built. Returned hit and record
  *       handles are borrowed from the cursor/view lifetime and never expose
  *       raw mapped JSON/list/dict/buffer pointers.
  */
@@ -549,9 +551,13 @@ n00b_query_cursor(n00b_query_view_t *view) _kargs
     // Newest-first iteration: walk the snapshot from the highest (most recent)
     // durable (generation, shard_id, ordinal) down to the oldest, so a limited
     // query returns the most recent matches. Default false (ascending durable
-    // order, required for resume-token pagination).
+    // order, required for resume-token pagination). A live view ignores it and
+    // delivers in ascending order.
     bool                 reverse    = false;
 };
+
+/** @brief Hit handles a snapshot or linear cursor reuses in turn. */
+#define N00B_QUERY_HIT_HANDLES 16u
 
 /**
  * @brief Advance a cursor by one hit.
@@ -568,21 +574,25 @@ n00b_query_cursor(n00b_query_view_t *view) _kargs
  * @post Advancing invalidates the previously returned borrowed hit, including
  *       when advancement reaches end/stop and returns none. The new hit
  *       remains valid until the next advance, cursor close, or view close.
+ *
+ * A snapshot cursor, and a live cursor while it delivers history, hands out
+ * its hits from @ref N00B_QUERY_HIT_HANDLES handles in turn, so it holds no
+ * memory per hit returned. A hit kept past
+ * its advance reports @ref N00B_QUERY_ERR_CLOSED until that many more hits
+ * have been returned; after that the same handle names a later hit. Copy
+ * anything needed past the next advance, for example with
+ * @ref n00b_query_hit_json_copy.
  */
 extern n00b_result_t(n00b_option_t(n00b_query_hit_t *))
 n00b_query_cursor_next(n00b_query_cursor_t *cursor);
 
 /**
- * @brief Enable streaming mode on a snapshot cursor.
+ * @brief Accepted and ignored.
  *
- * In streaming mode the cursor releases the prior boundary's resident shard(s)
- * and drops already-delivered hits before loading the next boundary, bounding
- * the resident working set (and thus RSS) regardless of the query limit. ONLY
- * safe when the consumer copies each hit's data out (e.g. via
- * @ref n00b_query_hit_json_copy) BEFORE calling @ref n00b_query_cursor_next
- * again — delivered hits and their borrowed record views are invalidated on the
- * next advance. Must not be used by callers that retain hits/records across
- * advances. Off by default.
+ * Snapshot cursors always stream: each advance releases the previous hit and
+ * its record, and a cursor pins at most one shard at a time, however many
+ * records match or whatever the limit. A caller that keeps data past the next
+ * advance copies it out first, for example with @ref n00b_query_hit_json_copy.
  */
 extern void
 n00b_query_cursor_set_streaming(n00b_query_cursor_t *cursor, bool on);
@@ -701,7 +711,8 @@ n00b_query_linear_cursor(n00b_query_view_t *view) _kargs
  *       (@ref n00b_query_hit_record, @ref n00b_query_hit_json_copy,
  *       @ref n00b_query_hit_pos). Stepping forward off the end and then back is
  *       defined: a @ref n00b_query_linear_cursor_prev after an end-of-range
- *       none re-yields the last record.
+ *       none re-yields the last record. Hit handles are reused as described
+ *       for @ref n00b_query_cursor_next.
  */
 extern n00b_result_t(n00b_option_t(n00b_query_hit_t *))
 n00b_query_linear_cursor_next(n00b_query_linear_cursor_t *cursor);
@@ -1108,6 +1119,11 @@ n00b_query_rows(n00b_query_result_t *result) _kargs
  * @post Notes are structured opaque values, not stdout/stderr diagnostics.
  *       Returned note handles are owned by @p result and are invalidated by
  *       @ref n00b_query_result_close.
+ *
+ * Notes are capped. Each aggregate keeps at most
+ * @ref N00B_QUERY_NOTE_EXAMPLES notes per reason, from the first records that
+ * raised it, and every kept note reports the total for its aggregate and
+ * reason through @ref n00b_query_note_occurrences.
  */
 extern n00b_result_t(n00b_query_note_list_t *)
 n00b_query_result_notes(n00b_query_result_t *result) _kargs
@@ -1204,6 +1220,19 @@ n00b_query_note_value(n00b_query_note_t *note);
  */
 extern n00b_result_t(n00b_string_t *)
 n00b_query_note_message(n00b_query_note_t *note);
+
+/** @brief Example notes kept per aggregate and reason. */
+#define N00B_QUERY_NOTE_EXAMPLES 8u
+
+/**
+ * @brief Return how many records raised this note's reason for its aggregate.
+ *
+ * @return Ok(count), which is at least one and counts records whose notes
+ *         were not kept, @ref N00B_QUERY_ERR_ARG for null, or
+ *         @ref N00B_QUERY_ERR_CLOSED after result close.
+ */
+extern n00b_result_t(uint64_t)
+n00b_query_note_occurrences(n00b_query_note_t *note);
 
 /**
  * @brief Close a finite query result and release result-owned resources.

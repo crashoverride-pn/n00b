@@ -97,12 +97,6 @@ polls_seeing(probe_t *probe, uint64_t acquired)
     return n;
 }
 
-static uint64_t
-ceil_polls(uint64_t units)
-{
-    return (units + 1023) / 1024;
-}
-
 static n00b_vfs_t *
 new_memory_vfs(void)
 {
@@ -281,19 +275,15 @@ cursor_polls(n00b_store_t *store, n00b_filter_t *filter, uint64_t *hits)
     CHECK(n00b_result_is_ok(cursor_r));
     n00b_query_cursor_t *cursor = n00b_result_get(cursor_r);
 
-    uint64_t count          = 0;
-    uint64_t polls_at_first = 0;
+    uint64_t count = 0;
     while (true) {
         auto next_r = n00b_query_cursor_next(cursor);
         CHECK(n00b_result_is_ok(next_r));
         if (!n00b_option_is_set(n00b_result_get(next_r))) {
             break;
         }
-        if (count++ == 0) {
-            polls_at_first = probe.polls;
-        }
+        count++;
     }
-    CHECK(polls_at_first == probe.polls);
     CHECK(n00b_result_is_ok(n00b_query_cursor_close(cursor)));
     CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
     *hits = count;
@@ -357,11 +347,10 @@ run_cancels_at(n00b_store_t  *store,
 }
 
 // ---------------------------------------------------------------------------
-// Ranked path. Before the cursor, n00b_query_run prepares each term: it walks
-// every boundary, the term's postings and their visible ordinals. Then the
-// cursor runs, each hit is materialized and scored, and with a limit below
-// the hit count the top ones are kept in a heap. One sealed shard, every
-// record matching the one term.
+// Ranked path. Before the cursor, n00b_query_run prepares each term, polling
+// per boundary and through the term's postings. Each position the cursor
+// yields then polls once per 1024, whether it is kept, scored, or offered to
+// the top-N heap. One sealed shard, every record matching the one term.
 // ---------------------------------------------------------------------------
 static void
 test_ranked_path_polls_each_loop(void)
@@ -378,43 +367,38 @@ test_ranked_path_polls_each_loop(void)
     run_shape_t ranked   = {.ranked = true, .limit = 0};
     run_shape_t top      = {.ranked = true, .limit = 10};
 
-    // Materialization.
+    // The position walk. Its last poll comes after the cursor's last, so
+    // cancelling there stops the run's own loop.
     uint64_t u = run_polls(store, filter, unranked);
     CHECK(u == c + LARGE_POLLS);
-    run_cancels_at(store, filter, unranked, c);
+    run_cancels_at(store, filter, unranked, u - 1);
 
-    // Term preparation (one boundary poll, then the postings walk and the
-    // visible-ordinal walk over df == LARGE_N), the cursor, materialization,
-    // and scoring. The first three cancel inside preparation, before any
-    // cursor exists.
-    uint64_t prepare = 1 + LARGE_POLLS + LARGE_POLLS;
+    // Term preparation, which runs first: one boundary poll, then the
+    // postings walk over df == LARGE_N.
+    uint64_t prepare = 1 + LARGE_POLLS;
     uint64_t r0      = run_polls(store, filter, ranked);
-    CHECK(r0 == prepare + u + LARGE_POLLS);
+    CHECK(r0 == u + prepare);
     run_cancels_at(store, filter, ranked, 0);
     run_cancels_at(store, filter, ranked, 1);
-    run_cancels_at(store, filter, ranked, 1 + LARGE_POLLS);
-    run_cancels_at(store, filter, ranked, prepare);
-    run_cancels_at(store, filter, ranked, prepare + c);
-    run_cancels_at(store, filter, ranked, prepare + u);
+    run_cancels_at(store, filter, ranked, r0 - 1);
 
-    // The top-N heap, which releases the hits it drops as it goes; a cancel
-    // midway must still leave every hit released.
+    // The top-N heap is fed by the same walk and adds no polls of its own; a
+    // cancel inside the walk must still leave every hit released.
     uint64_t rl = run_polls(store, filter, top);
-    CHECK(rl == r0 + LARGE_POLLS);
-    run_cancels_at(store, filter, top, r0);
+    CHECK(rl == r0);
     run_cancels_at(store, filter, top, rl - 1);
 
     close_store(store);
-    printf("  [PASS] ranked path polls materialization, prepare, score, "
-           "ordering (cursor=%llu ranked=%llu)\n",
+    printf("  [PASS] ranked path polls prepare and the position walk "
+           "(cursor=%llu ranked=%llu)\n",
            (unsigned long long)c,
            (unsigned long long)rl);
 }
 
 // ---------------------------------------------------------------------------
-// Ranked path over hot records. Preparation first looks the term up in the hot
-// shard under the hot pin and walks its postings, then walks the boundary as
-// above. A seal waits on that pin, so the walk has to answer the hook.
+// Ranked path over hot records. Preparation looks the term up in the hot shard
+// under the hot pin and walks its postings. A seal waits on that pin, so the
+// walk has to answer the hook.
 // ---------------------------------------------------------------------------
 static void
 test_ranked_hot_walk_polls(void)
@@ -434,14 +418,12 @@ test_ranked_hot_walk_polls(void)
     uint64_t    u        = run_polls(store, filter, unranked);
     CHECK(u == c + LARGE_POLLS);
 
-    // The hot postings walk, one boundary poll, the visible-ordinal walk,
-    // then the cursor, materialization, and scoring.
-    uint64_t prepare = LARGE_POLLS + 1 + LARGE_POLLS;
+    // The boundary poll, then the hot postings walk, then the position walk.
+    uint64_t prepare = 1 + LARGE_POLLS;
     uint64_t r       = run_polls(store, filter, ranked);
-    CHECK(r == prepare + u + LARGE_POLLS);
+    CHECK(r == prepare + u);
 
-    // Poll 1 is inside the hot postings walk, which the counts above place
-    // first. A seal waits on the hot pin, so it finishing shows the cancel
+    // Poll 1 is the first of the hot postings walk, after the boundary poll. A seal waits on the hot pin, so it finishing shows the cancel
     // released it.
     run_cancels_at(store, filter, ranked, 1);
     seal_unblocked(store);
@@ -453,12 +435,13 @@ test_ranked_hot_walk_polls(void)
 }
 
 // ---------------------------------------------------------------------------
-// Aggregate path. The per-hit loop polls; a group-by also polls while it walks
-// the groups seen so far to find a hit's row, which with every key distinct is
-// LARGE_N * (LARGE_N - 1) / 2 comparisons.
+// Aggregate path. COUNT alone sums each boundary's matches without walking
+// them, so it polls only while planning, where the cursor also polls once per
+// 1024 positions it walks. A group-by walks every hit and polls per hit; its
+// row is found by digest, with no search to poll.
 // ---------------------------------------------------------------------------
 static void
-test_aggregate_path_polls_hits_and_group_search(void)
+test_aggregate_path_polls_each_hit(void)
 {
     n00b_store_t  *store  = open_store(nullptr);
     n00b_filter_t *filter = contains_alpha();
@@ -470,8 +453,8 @@ test_aggregate_path_polls_hits_and_group_search(void)
 
     run_shape_t count = {.count = true};
     uint64_t    a     = run_polls(store, filter, count);
-    CHECK(a == c + LARGE_POLLS);
-    run_cancels_at(store, filter, count, c);
+    CHECK(a == c - LARGE_POLLS);
+    run_cancels_at(store, filter, count, a - 1);
 
     n00b_query_group_by_list_t *group_by =
         n00b_alloc(n00b_query_group_by_list_t);
@@ -480,14 +463,12 @@ test_aggregate_path_polls_hits_and_group_search(void)
     n00b_list_push(*group_by, field_ok(r"id"));
     run_shape_t grouped = {.count = true, .group_by = group_by};
 
-    uint64_t compared = (uint64_t)LARGE_N * (LARGE_N - 1) / 2;
-    uint64_t g        = run_polls(store, filter, grouped);
-    CHECK(g == c + ceil_polls(LARGE_N + compared));
-    run_cancels_at(store, filter, grouped, c + 100);
+    uint64_t g = run_polls(store, filter, grouped);
+    CHECK(g == c + LARGE_POLLS);
+    run_cancels_at(store, filter, grouped, g - 1);
 
     close_store(store);
-    printf("  [PASS] aggregate path polls per hit and per group compared "
-           "(grouped=%llu)\n",
+    printf("  [PASS] aggregate path polls per hit (grouped=%llu)\n",
            (unsigned long long)g);
 }
 
@@ -538,73 +519,6 @@ test_store_sealed_polls_per_shard(void)
 
     close_store(store);
     printf("  [PASS] store_sealed polls per shard in both passes\n");
-}
-
-// ---------------------------------------------------------------------------
-// A streaming cursor built out in bulk (n00b_query_cursor_hit_count) plans the
-// whole store in one n00b_plan_store_sealed once
-// ROCS_QUERY_STREAM_BULK_PREFLIGHT_AFTER_EMPTY (8) boundaries in a row came
-// back empty. That fan-out's collect pass is the only place S polls happen
-// back to back with no shard acquired between them.
-// ---------------------------------------------------------------------------
-static void
-test_streaming_preflight_passes_cancel(void)
-{
-    const uint64_t shards = 12;
-    n00b_store_t  *store  = open_store(nullptr);
-    // Each shard's level bounds must span "error" without holding one
-    // ("debug" < "error" < "info"). A shard whose bounds exclude "error" is
-    // pruned before the fan-out reaches it, and with every shard pruned the
-    // collect pass makes no polls for this test to observe.
-    int64_t id = 0;
-    for (uint64_t s = 0; s < shards; s++) {
-        for (uint64_t i = 0; i < 10; i++) {
-            ingest(store, id++, (i & 1) ? r"info" : r"debug");
-        }
-        seal(store, 1000 + s);
-    }
-    auto kept_r = n00b_plan_store_sealed(store,
-                                         lowered(level_is(r"error")),
-                                         nullptr);
-    CHECK(n00b_result_is_ok(kept_r));
-    CHECK(n00b_result_get(n00b_plan_shard_result_count(
-              n00b_result_get(kept_r)))
-          == shards);
-
-    auto view_r = n00b_query_view(store, level_is(r"error"), .limit = 0);
-    CHECK(n00b_result_is_ok(view_r));
-    n00b_query_view_t *view = n00b_result_get(view_r);
-
-    probe_t probe    = probe_tracking(NEVER, store);
-    auto    cursor_r = n00b_query_cursor(view,
-                                         .cancel_cb  = probe_poll,
-                                         .cancel_ctx = &probe);
-    CHECK(n00b_result_is_ok(cursor_r));
-    n00b_query_cursor_t *cursor = n00b_result_get(cursor_r);
-    n00b_query_cursor_set_streaming(cursor, true);
-
-    auto count_r = n00b_query_cursor_hit_count(cursor);
-    CHECK(n00b_result_is_ok(count_r));
-    CHECK(n00b_result_get(count_r) == 0);
-
-    uint64_t longest = 0;
-    uint64_t run     = 0;
-    for (uint64_t i = 0; i < probe.polls && i < probe.acquired_cap; i++) {
-        run = (i != 0 && probe.acquired[i] == probe.acquired[i - 1])
-                  ? run + 1
-                  : 1;
-        if (run > longest) {
-            longest = run;
-        }
-    }
-    CHECK(longest >= shards);
-
-    CHECK(n00b_result_is_ok(n00b_query_cursor_close(cursor)));
-    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
-    close_store(store);
-    printf("  [PASS] streaming preflight fan-out polls the cursor's hook "
-           "(longest run=%llu)\n",
-           (unsigned long long)longest);
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,28 +1100,33 @@ live_view(n00b_store_t *store)
     return n00b_result_get(view_r);
 }
 
+// A live cursor walks its sealed history on its first next, one shard at a
+// time, and construction does no work for a cancel to cut short.
 static void
-test_live_cursor_construction_passes_cancel(void)
+test_live_cursor_history_passes_cancel(void)
 {
     const uint64_t shards = 4;
     live_ctx_t     ctx    = live_ctx_new(9601);
     fill_sealed(ctx.store, shards, 100, r"error");
     n00b_query_view_t *view = live_view(ctx.store);
 
-    // The first poll is the fan-out's, made before any shard is acquired.
-    uint64_t a0       = acquisitions(ctx.store);
-    probe_t  probe    = probe_new(0);
-    auto     cursor_r = n00b_query_cursor(view,
-                                          .cancel_cb  = probe_poll,
-                                          .cancel_ctx = &probe);
-    CHECK(n00b_result_is_err(cursor_r));
-    CHECK(n00b_result_get_err(cursor_r) == N00B_QUERY_ERR_CANCELED);
-    CHECK(probe.polls == 1);
-    CHECK(acquisitions(ctx.store) == a0);
+    probe_t probe    = probe_new(0);
+    auto    cursor_r = n00b_query_cursor(view,
+                                         .cancel_cb  = probe_poll,
+                                         .cancel_ctx = &probe);
+    CHECK(n00b_result_is_ok(cursor_r));
+    CHECK(probe.polls == 0);
+    n00b_query_cursor_t *cursor = n00b_result_get(cursor_r);
 
+    auto next_r = n00b_query_cursor_next(cursor);
+    CHECK(n00b_result_is_err(next_r));
+    CHECK(n00b_result_get_err(next_r) == N00B_QUERY_ERR_CANCELED);
+    CHECK(probe.polls == 1);
+
+    CHECK(n00b_result_is_ok(n00b_query_cursor_close(cursor)));
     CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
     live_ctx_destroy(&ctx);
-    printf("  [PASS] live cursor construction honors the cursor's hook\n");
+    printf("  [PASS] live cursor history honors the cursor's hook\n");
 }
 
 static void
@@ -1326,15 +1245,14 @@ main(int argc, char **argv)
     printf("test_rocs_query_cancel:\n");
     test_ranked_path_polls_each_loop();
     test_ranked_hot_walk_polls();
-    test_aggregate_path_polls_hits_and_group_search();
+    test_aggregate_path_polls_each_hit();
     test_store_sealed_polls_per_shard();
-    test_streaming_preflight_passes_cancel();
     test_hot_tail_scan_polls_execution_and_copy();
     test_hot_boundary_cancel_maps_to_query_canceled();
     test_cursor_cancel_is_sticky();
     test_cursor_failure_is_sticky();
     test_every_cursor_failure_is_sticky();
-    test_live_cursor_construction_passes_cancel();
+    test_live_cursor_history_passes_cancel();
     test_live_tail_scan_passes_cancel();
     test_live_tail_scan_stops_on_close();
 

@@ -535,9 +535,9 @@ seal_at_hot_read(n00b_store_t             *store,
     CHECK(n00b_result_is_ok(n00b_store_seal_hot_shard(store)));
 }
 
-// Seal the hot shard just as ranking goes to read its postings. The cursor
-// must then deliver no hot record, since none of them was scored: every hit
-// that comes back scores above zero.
+// Seal the hot shard just as ranking goes to read its postings. Ranking then
+// reads the boundary from the sealed image, as the cursor does, so every hit
+// that comes back is scored above zero.
 static void
 test_ranking_survives_a_seal_during_the_query(void)
 {
