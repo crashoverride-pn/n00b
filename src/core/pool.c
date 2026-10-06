@@ -1631,7 +1631,7 @@ delete_one_page_entry(n00b_pool_t *pool, n00b_pool_page_t *entry)
     if (entry->next) {
         entry->next->prev = entry->prev;
     }
-    n00b_alloc_interpose_forget_pages(entry->interpose_slot);
+    n00b_alloc_interpose_forget_pages(entry->interpose_slot, (void *)entry);
 
     /* Capture mapped_size while we still hold the lock; the munmap
      * itself is fine to do unlocked once the page is unlinked. */
@@ -1756,7 +1756,7 @@ pool_destroy(n00b_pool_t *pool)
         pool_page_diag_unregister(entry);
         if (entry->interpose_slot != 0) {
             pool_page_gate_t gate = pool_page_gate_enter();
-            n00b_alloc_interpose_forget_pages(entry->interpose_slot);
+            n00b_alloc_interpose_forget_pages(entry->interpose_slot, (void *)entry);
             pool_page_gate_exit(gate);
         }
         uint64_t fail_before = atomic_load(&n00b_munmap_fail_count);

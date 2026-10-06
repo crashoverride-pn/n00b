@@ -231,7 +231,29 @@ main(int argc, char **argv)
     n00b_interposed_free(gp);
     printf("  [PASS] scratch_allocators_fall_back_to_user_pool\n");
 
-    // 10. require() must not abort when interposition is active.
+    // 10. Forgetting a page validates its slot. The range is never touched:
+    //     a free inside it is dropped while it is recorded, and would reach
+    //     libc free(), which aborts, once it is not.
+    char    *fake  = (char *)((uintptr_t)1 << 40);
+    char    *fake2 = fake + (1 << 20);
+    uint32_t slot  = n00b_alloc_interpose_note_pages(fake, fake + 4096);
+    assert(slot != 0);
+    n00b_alloc_interpose_forget_pages(4096001, fake); // no chunk maps this slot
+    n00b_alloc_interpose_forget_pages(slot, fake2);   // records another page
+    n00b_interposed_free(fake + 128);
+
+    n00b_alloc_interpose_forget_pages(slot, fake);
+    n00b_alloc_interpose_forget_pages(slot, fake); // already retired
+    uint32_t a = n00b_alloc_interpose_note_pages(fake, fake + 4096);
+    uint32_t b = n00b_alloc_interpose_note_pages(fake2, fake2 + 4096);
+    assert(a != 0 && b != 0 && a != b);
+    n00b_interposed_free(fake + 128);
+    n00b_interposed_free(fake2 + 128);
+    n00b_alloc_interpose_forget_pages(a, fake);
+    n00b_alloc_interpose_forget_pages(b, fake2);
+    printf("  [PASS] forget_validates_slot\n");
+
+    // 11. require() must not abort when interposition is active.
     n00b_require_alloc_interposition(r"alloc_interpose self-test");
     printf("  [PASS] require_ok\n");
 

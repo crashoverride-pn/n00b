@@ -421,7 +421,7 @@ n00b_alloc_interpose_note_pages(void *start, void *end)
 }
 
 void
-n00b_alloc_interpose_forget_pages(uint32_t slot)
+n00b_alloc_interpose_forget_pages(uint32_t slot, void *start)
 {
     if (slot == 0) {
         return;
@@ -429,7 +429,19 @@ n00b_alloc_interpose_forget_pages(uint32_t slot)
     while (atomic_exchange_explicit(&interpose_range_lock, 1, memory_order_acquire) != 0) {
     }
 
-    n00b_interpose_range_t *r = range_slot(slot - 1);
+    // Retire the slot only if it is live and records this page. A stale or
+    // repeated forget would otherwise drop another page's record or put the
+    // slot on the free list twice, and either one later sends n00b memory to
+    // libc free().
+    n00b_interpose_range_t *r = nullptr;
+    if (slot - 1 < atomic_load_explicit(&interpose_slots_used, memory_order_relaxed)) {
+        r = range_slot(slot - 1);
+    }
+    if (r == nullptr || atomic_load_explicit(&r->end, memory_order_relaxed) == 0
+        || atomic_load_explicit(&r->start, memory_order_relaxed) != (uintptr_t)start) {
+        atomic_store_explicit(&interpose_range_lock, 0, memory_order_release);
+        return;
+    }
     atomic_store_explicit(&r->end, 0, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
     atomic_store_explicit(&r->start, UINTPTR_MAX - interpose_free_head, memory_order_relaxed);
@@ -438,6 +450,9 @@ n00b_alloc_interpose_forget_pages(uint32_t slot)
     atomic_store_explicit(&interpose_range_lock, 0, memory_order_release);
 }
 
+// Linear in the slots ever in use at once. malloc never calls this; free does
+// for any pointer the mmap tree does not resolve, which while the runtime is
+// live means libc's own pre-init chunks.
 static bool
 interpose_range_contains(void *ptr)
 {

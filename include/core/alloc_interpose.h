@@ -144,10 +144,13 @@ extern uint32_t n00b_alloc_interpose_note_pages(void *start, void *end);
 
 /**
  * @brief Drop the record of a `.libc_backing` pool page before it is released.
- * @param slot The value @ref n00b_alloc_interpose_note_pages returned; 0 is a
- *             no-op.
+ * @param slot  The value @ref n00b_alloc_interpose_note_pages returned.
+ * @param start The start passed to that call.
+ *
+ * A no-op unless @p slot is live and records @p start, so a zero, stale, or
+ * repeated slot leaves the table intact.
  */
-extern void n00b_alloc_interpose_forget_pages(uint32_t slot);
+extern void n00b_alloc_interpose_forget_pages(uint32_t slot, void *start);
 
 /**
  * @brief True if libc-malloc interposition is active in this process.
