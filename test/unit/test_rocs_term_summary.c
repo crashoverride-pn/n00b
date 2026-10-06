@@ -1287,25 +1287,22 @@ test_fanout_skips_ruled_out_shards(void)
     n00b_vfs_t *vfss[2] = {with, without};
     open_opts_t opts[2] = {on, off};
 
+    // Both stores are sealed without value bounds. Every value these cases
+    // rule out lies outside its shard's bounds, so bounds would skip the
+    // same shards the summary does, and the counts below would hold with
+    // the summary skip deleted. Without them, the summary store's skips are
+    // the summary's alone, and the control store maps both shards.
+    bool zones = n00b_store_zone_maps_enabled();
+    n00b_store_zone_maps_set_enabled(false);
     for (int i = 0; i < 2; i++) {
-        // The i==1 store is the control: it has no TERM summary, and the
-        // assertion below is that nothing prunes, so both shards are mapped.
-        // Value bounds (n00b#470) prune on their own and would falsify that
-        // premise, so this arm is sealed with them off too -- the toggle
-        // exists for exactly this and changes only how many shards are
-        // mapped, never which records come back.
-        bool zones = n00b_store_zone_maps_enabled();
-        n00b_store_zone_maps_set_enabled(i == 0);
-
         n00b_store_t *store = open_with(vfss[i], opts[i]);
         ingest(store, 1, "a", "h1");
         seal(store, 1000);
         ingest(store, 2, "b", "h3");
         seal(store, 2000);
         close_store(store);
-
-        n00b_store_zone_maps_set_enabled(zones);
     }
+    n00b_store_zone_maps_set_enabled(zones);
 
     struct {
         n00b_plan_predicate_t *pred;

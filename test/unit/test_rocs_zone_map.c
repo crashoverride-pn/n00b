@@ -13,6 +13,7 @@
  */
 
 #include <stdint.h>
+#include <string.h>
 
 #include "n00b.h"
 #include "core/runtime.h"
@@ -1273,6 +1274,69 @@ test_a_recovered_shard_keeps_its_bounds(void)
     CHECK(n00b_result_is_ok(n00b_store_close(recovered)));
 }
 
+#ifdef N00B_DEBUG
+static bool
+fail_kind_boom(n00b_store_fault_t fault, n00b_json_node_t *record, void *ctx)
+{
+    (void)ctx;
+    if (fault != N00B_STORE_FAULT_RANGE_PREPARE) {
+        return false;
+    }
+    n00b_json_node_t *kind = n00b_json_object_get(record, r"kind");
+    return n00b_json_is_string(kind)
+        && strcmp(n00b_json_as_cstr(kind), "boom") == 0;
+}
+
+static n00b_json_node_t *
+record_kind(int64_t id, n00b_string_t *kind)
+{
+    n00b_json_node_t *record = n00b_json_object_new();
+    n00b_json_object_put_n00b(record, r"id", n00b_json_int_new(id));
+    n00b_json_object_put_n00b(record,
+                              r"kind",
+                              n00b_json_string_new_from_n00b(kind));
+    return record;
+}
+
+// A batch record whose worker-side prepare fails is stored as a tombstone of
+// kind "rocs.ingest_error". The shard's kind bounds have to cover that value,
+// or a query for it prunes the one shard holding it.
+static void
+test_a_batch_tombstone_widens_the_bounds(void)
+{
+    n00b_store_t *store = open_store(new_memory_vfs());
+
+    n00b_store_record_list_t *records = n00b_alloc(n00b_store_record_list_t);
+    *records = n00b_list_new_private(n00b_json_node_t *,
+                                     .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    n00b_list_push(*records, record_kind(1, r"auth"));
+    n00b_list_push(*records, record_kind(2, r"boom"));
+    n00b_list_push(*records, record_kind(3, r"login"));
+
+    n00b_store_fault_hook_set(fail_kind_boom, nullptr);
+    auto batch_r = n00b_store_ingest_batch(store, records, .worker_count = 2);
+    n00b_store_fault_hook_set(nullptr, nullptr);
+    CHECK(n00b_result_is_ok(batch_r));
+    CHECK(n00b_result_get(batch_r) == 3);
+
+    auto memory_r = n00b_store_memory_stats(store);
+    CHECK(n00b_result_is_ok(memory_r));
+    CHECK(n00b_result_get(memory_r).hot_worker_range_tombstones == 1);
+    seal(store, 1000);
+
+    uint64_t matched = 0;
+    CHECK(shards_read(store,
+                      predicate_eq_str(r"kind", r"rocs.ingest_error"),
+                      &matched)
+          == 1);
+    CHECK(matched == 1);
+
+    // Past the widened bound, the shard still prunes.
+    CHECK(shards_read(store, predicate_eq_str(r"kind", r"zzz"), &matched)
+          == 0);
+}
+#endif
+
 int
 main(int argc, char **argv)
 {
@@ -1300,6 +1364,9 @@ main(int argc, char **argv)
     test_close_writes_the_hot_shards_bounds();
     test_an_empty_string_bound_survives_a_reopen();
     test_a_recovered_shard_keeps_its_bounds();
+#ifdef N00B_DEBUG
+    test_a_batch_tombstone_widens_the_bounds();
+#endif
 
     n00b_shutdown();
     return 0;

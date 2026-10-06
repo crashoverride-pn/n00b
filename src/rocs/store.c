@@ -342,7 +342,7 @@ struct n00b_store_catalog_entry_t {
     n00b_string_t *partition_key;
     n00b_string_t *etag;
     n00b_store_map_t *resident_map;
-    // Null for an entry written before catalog v5, and for one whose shard
+    // Null for an entry written before catalog v6, and for one whose shard
     // recorded no orderable value. Both read as "prunes nothing".
     rocs_store_zone_map_t *zones;
     uint64_t       shard_id;
@@ -723,6 +723,9 @@ typedef struct {
     n00b_store_raw_span_t        *raw_span;
     n00b_store_shard_prepared_slot_t *prepared;
     rocs_store_posting_target_list_t *targets;
+    // The record the slot holds: the batch record, or the tombstone that
+    // replaced it.
+    n00b_json_node_t             *stored;
     uint64_t                      byte_delta;
     bool                          tombstone;
     n00b_err_t                    err;
@@ -877,6 +880,27 @@ rocs_store_buffer_from_record_text(n00b_string_t    *text,
                                   .allocator = allocator);
 }
 
+#ifdef N00B_DEBUG
+static n00b_store_fault_hook_t rocs_store_fault_hook     = nullptr;
+static void                   *rocs_store_fault_hook_ctx = nullptr;
+
+void
+n00b_store_fault_hook_set(n00b_store_fault_hook_t hook, void *ctx)
+{
+    rocs_store_fault_hook_ctx = ctx;
+    rocs_store_fault_hook     = hook;
+}
+
+static bool
+rocs_store_fault(n00b_store_fault_t fault, n00b_json_node_t *record)
+{
+    return rocs_store_fault_hook != nullptr
+        && rocs_store_fault_hook(fault, record, rocs_store_fault_hook_ctx);
+}
+#else
+#define rocs_store_fault(fault, record) false
+#endif
+
 static void
 rocs_store_range_prepare_worker(void *job_v, void *user_data)
 {
@@ -903,6 +927,14 @@ rocs_store_range_prepare_worker(void *job_v, void *user_data)
     job->prepared    = nullptr;
     job->targets     = nullptr;
     job->tombstone   = false;
+
+    if (rocs_store_fault(N00B_STORE_FAULT_RANGE_PREPARE,
+                         job->batch_job->record)) {
+        job->err = N00B_STORE_ERR_INTERNAL;
+        n00b_restore_current_allocator(prev_alloc);
+        n00b_gc_attrib_exit_ingest(prev_ingest);
+        return;
+    }
 
     auto prepared_r = n00b_store_shard_prepare_reserved_slot(
         job->hot,
@@ -4486,7 +4518,7 @@ rocs_store_catalog_append_entry(n00b_store_t               *store,
         return n00b_result_err(bool, n00b_result_get_err(r));
     }
 
-    // Zone maps (catalog v5). Only fields with a usable interval are written:
+    // Zone maps (catalog v6). Only fields with a usable interval are written:
     // an unusable one prunes nothing, so recording it would cost bytes in
     // every catalog write to say "ask the shard", which is what a missing
     // entry already says.
@@ -8794,8 +8826,10 @@ rocs_store_ingest_prepared_range_unlocked(
     n00b_worker_pool_t           *worker_pool,
     int32_t                       worker_count,
     int32_t                       queue_capacity,
-    bool                          reverse_publish)
+    bool                          reverse_publish,
+    uint64_t                     *committed_out)
 {
+    *committed_out = 0;
     if (store == nullptr || jobs == nullptr || count == 0
         || store->hot_shard == nullptr) {
         return n00b_result_err(uint64_t, N00B_STORE_ERR_ARG);
@@ -8840,7 +8874,8 @@ rocs_store_ingest_prepared_range_unlocked(
         rocs_store_range_commit_job_t *,
         (int64_t)count,
         &(n00b_alloc_opts_t){.allocator = allocator});
-    if (commit_jobs == nullptr) {
+    if (commit_jobs == nullptr
+        || rocs_store_fault(N00B_STORE_FAULT_RANGE_JOB_ARRAY, nullptr)) {
         (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
                                                        start,
                                                        count);
@@ -8855,7 +8890,8 @@ rocs_store_ingest_prepared_range_unlocked(
         rocs_store_range_commit_job_t *job = n00b_alloc_with_opts(
             rocs_store_range_commit_job_t,
             &(n00b_alloc_opts_t){.allocator = allocator});
-        if (job == nullptr) {
+        if (job == nullptr
+            || rocs_store_fault(N00B_STORE_FAULT_RANGE_JOB, jobs[i]->record)) {
             (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
                                                            start,
                                                            count);
@@ -8868,6 +8904,7 @@ rocs_store_ingest_prepared_range_unlocked(
         job->store       = store;
         job->hot         = store->hot_shard;
         job->batch_job   = jobs[i];
+        job->stored      = jobs[i]->record;
         job->raw_span    = nullptr;
         job->prepared    = nullptr;
         job->targets     = nullptr;
@@ -8875,8 +8912,13 @@ rocs_store_ingest_prepared_range_unlocked(
         job->tombstone   = false;
         job->err         = N00B_STORE_OK;
         if (store->hot_shard->retain_raw != nullptr) {
-            auto span_r = n00b_store_shard_reserve_raw_span(store->hot_shard,
-                                                            jobs[i]->raw);
+            auto span_r =
+                rocs_store_fault(N00B_STORE_FAULT_RANGE_RAW_SPAN,
+                                 jobs[i]->record)
+                    ? n00b_result_err(n00b_store_raw_span_t *,
+                                      N00B_STORE_SHARD_ERR_EVENT)
+                    : n00b_store_shard_reserve_raw_span(store->hot_shard,
+                                                        jobs[i]->raw);
             if (n00b_result_is_err(span_r)) {
                 (void)n00b_store_shard_cancel_tail_reservation(
                     store->hot_shard,
@@ -8899,13 +8941,16 @@ rocs_store_ingest_prepared_range_unlocked(
     }
     int32_t cap = queue_capacity <= 0 ? workers : queue_capacity;
     if (worker_pool != nullptr) {
-        n00b_err_t worker_err = rocs_store_run_service_worker_jobs(
-            worker_pool,
-            rocs_store_range_prepare_worker,
-            (void *const *)commit_jobs,
-            count,
-            nullptr,
-            allocator);
+        n00b_err_t worker_err =
+            rocs_store_fault(N00B_STORE_FAULT_RANGE_WORKERS, nullptr)
+                ? N00B_STORE_ERR_INTERNAL
+                : rocs_store_run_service_worker_jobs(
+                      worker_pool,
+                      rocs_store_range_prepare_worker,
+                      (void *const *)commit_jobs,
+                      count,
+                      nullptr,
+                      allocator);
         if (worker_err != N00B_STORE_OK) {
             (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
                                                            start,
@@ -8918,12 +8963,14 @@ rocs_store_ingest_prepared_range_unlocked(
         }
     }
     else {
-        n00b_worker_pool_t *commit_pool = n00b_worker_pool_new(
-            workers,
-            cap,
-            rocs_store_range_prepare_worker,
-            nullptr,
-            .allocator = allocator);
+        n00b_worker_pool_t *commit_pool =
+            rocs_store_fault(N00B_STORE_FAULT_RANGE_WORKERS, nullptr)
+                ? nullptr
+                : n00b_worker_pool_new(workers,
+                                       cap,
+                                       rocs_store_range_prepare_worker,
+                                       nullptr,
+                                       .allocator = allocator);
         if (commit_pool == nullptr) {
             (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
                                                            start,
@@ -8940,12 +8987,18 @@ rocs_store_ingest_prepared_range_unlocked(
         n00b_worker_pool_shutdown(commit_pool);
     }
 
-    uint64_t total_byte_delta = 0;
+    // Ready counts the leading slots filled, each journaled first when the
+    // journal is on. A failure stops there: the slots before it are
+    // committed, which keeps the journal and the shard in agreement, and the
+    // rest of the reservation is released so later records still publish.
+    // A rest that cannot be released stays reserved; the prefix is committed
+    // all the same. Either way the range reports the failure that stopped it,
+    // with the prefix in committed_out.
+    uint64_t   total_byte_delta = 0;
+    uint64_t   ready            = count;
+    n00b_err_t prepare_err      = N00B_STORE_OK;
     for (uint64_t i = 0; i < count; i++) {
         rocs_store_range_commit_job_t *job = commit_jobs[i];
-        if (job == nullptr) {
-            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
-        }
         if (job->prepared == nullptr || job->targets == nullptr
             || job->err != N00B_STORE_OK) {
             n00b_json_node_t *tombstone =
@@ -8953,38 +9006,50 @@ rocs_store_ingest_prepared_range_unlocked(
                                                        ? N00B_STORE_ERR_INTERNAL
                                                        : job->err,
                                                    allocator);
-            if (tombstone == nullptr) {
-                while (begun != 0) {
-                    rocs_store_hot_writer_end_unlocked(store);
-                    begun--;
-                }
-                return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+            if (tombstone == nullptr
+                || rocs_store_fault(N00B_STORE_FAULT_RANGE_TOMBSTONE,
+                                    job->batch_job->record)) {
+                ready       = i;
+                prepare_err = N00B_STORE_ERR_INTERNAL;
+                break;
             }
-            auto prepared_r = n00b_store_shard_prepare_reserved_slot(
-                store->hot_shard,
-                tombstone,
-                .raw_span = job->raw_span,
-                .allocator = allocator);
+            auto prepared_r =
+                rocs_store_fault(N00B_STORE_FAULT_RANGE_TOMBSTONE_SLOT,
+                                 job->batch_job->record)
+                    ? n00b_result_err(n00b_store_shard_prepared_slot_t *,
+                                      N00B_STORE_SHARD_ERR_ARG)
+                    : n00b_store_shard_prepare_reserved_slot(
+                          store->hot_shard,
+                          tombstone,
+                          .raw_span  = job->raw_span,
+                          .allocator = allocator);
             if (n00b_result_is_err(prepared_r)) {
-                while (begun != 0) {
-                    rocs_store_hot_writer_end_unlocked(store);
-                    begun--;
-                }
-                return n00b_result_err(uint64_t,
-                                       n00b_result_get_err(prepared_r));
+                ready       = i;
+                prepare_err = n00b_result_get_err(prepared_r);
+                break;
             }
+            // Indexed like the single-record path's tombstone, so an
+            // indexed query finds it. One that cannot be indexed is still
+            // stored: its slot is reserved, and an unfilled slot would hold
+            // back every later record in the hot shard.
+            auto targets_r = rocs_store_prepare_index_targets(store,
+                                                              store->hot_shard,
+                                                              tombstone,
+                                                              allocator);
             job->prepared   = n00b_result_get(prepared_r);
-            job->targets    = nullptr;
+            job->targets    = n00b_result_is_ok(targets_r)
+                                  ? n00b_result_get(targets_r)
+                                  : nullptr;
             job->byte_delta = job->prepared->byte_delta;
             job->tombstone  = true;
-            n00b_atomic_add(&store->hot_worker_range_tombstones, 1);
+            job->stored     = tombstone;
         }
-        if (job->prepared == nullptr || job->prepared->record_text == nullptr) {
-            while (begun != 0) {
-                rocs_store_hot_writer_end_unlocked(store);
-                begun--;
-            }
-            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
+        if (job->prepared->record_text == nullptr
+            || rocs_store_fault(N00B_STORE_FAULT_RANGE_RECORD_TEXT,
+                                job->batch_job->record)) {
+            ready       = i;
+            prepare_err = N00B_STORE_ERR_INTERNAL;
+            break;
         }
         if (rocs_store_journal_active(store)) {
             n00b_buffer_t *journal_raw = nullptr;
@@ -8996,25 +9061,51 @@ rocs_store_ingest_prepared_range_unlocked(
                 journal_raw = rocs_store_buffer_from_record_text(
                     job->prepared->record_text,
                     allocator);
-                if (journal_raw == nullptr) {
-                    while (begun != 0) {
-                        rocs_store_hot_writer_end_unlocked(store);
-                        begun--;
-                    }
-                    return n00b_result_err(uint64_t,
-                                           N00B_STORE_ERR_INTERNAL);
+                if (journal_raw == nullptr
+                    || rocs_store_fault(N00B_STORE_FAULT_RANGE_JOURNAL_BUFFER,
+                                        job->batch_job->record)) {
+                    ready       = i;
+                    prepare_err = N00B_STORE_ERR_INTERNAL;
+                    break;
                 }
             }
-            auto journal_r = rocs_store_journal_append(store, journal_raw);
+            auto journal_r =
+                rocs_store_fault(N00B_STORE_FAULT_JOURNAL,
+                                 job->batch_job->record)
+                    ? n00b_result_err(bool, N00B_STORE_ERR_VFS)
+                    : rocs_store_journal_append(store, journal_raw);
             if (n00b_result_is_err(journal_r)) {
-                while (begun != 0) {
-                    rocs_store_hot_writer_end_unlocked(store);
-                    begun--;
-                }
-                return n00b_result_err(uint64_t,
-                                       n00b_result_get_err(journal_r));
+                ready       = i;
+                prepare_err = n00b_result_get_err(journal_r);
+                break;
             }
         }
+        auto fill_r =
+            rocs_store_fault(N00B_STORE_FAULT_FILL, job->batch_job->record)
+                ? n00b_result_err(bool, N00B_STORE_SHARD_ERR_STATE)
+                : n00b_store_shard_fill_prepared_reserved(
+                      store->hot_shard,
+                      start + i,
+                      job->prepared,
+                      .account_byte_estimate = false);
+        if (n00b_result_is_err(fill_r)) {
+            ready       = i;
+            prepare_err = n00b_result_get_err(fill_r)
+                                  == N00B_STORE_SHARD_ERR_STATE
+                              ? N00B_STORE_ERR_STATE
+                              : N00B_STORE_ERR_ARG;
+            break;
+        }
+        n00b_atomic_add(&store->hot_record_text_bytes,
+                        (uint64_t)job->prepared->record_text->u8_bytes);
+        rocs_store_commit_index_targets(job->targets, start + i);
+        if (job->tombstone) {
+            n00b_atomic_add(&store->hot_worker_range_tombstones, 1);
+        }
+        else {
+            n00b_atomic_add(&store->hot_worker_range_commits, 1);
+        }
+        rocs_store_zone_observe(store, job->stored);
         if (UINT64_MAX - total_byte_delta < job->byte_delta) {
             total_byte_delta = UINT64_MAX;
         }
@@ -9023,29 +9114,22 @@ rocs_store_ingest_prepared_range_unlocked(
         }
     }
 
-    for (uint64_t i = 0; i < count; i++) {
-        rocs_store_range_commit_job_t *job = commit_jobs[i];
-        auto fill_r = n00b_store_shard_fill_prepared_reserved(
-            store->hot_shard,
-            start + i,
-            job->prepared,
-            .account_byte_estimate = false);
-        if (n00b_result_is_err(fill_r)) {
-            while (begun != 0) {
-                rocs_store_hot_writer_end_unlocked(store);
-                begun--;
-            }
-            return n00b_result_err(uint64_t, n00b_result_get_err(fill_r));
+    bool stopped   = ready < count;
+    bool tail_held = false;
+    if (stopped) {
+        tail_held = rocs_store_fault(N00B_STORE_FAULT_RANGE_CANCEL, nullptr)
+                 || n00b_result_is_err(n00b_store_shard_cancel_tail_reservation(
+                        store->hot_shard,
+                        start + ready,
+                        count - ready));
+        while (begun > ready) {
+            rocs_store_hot_writer_end_unlocked(store);
+            begun--;
         }
-        n00b_atomic_add(&store->hot_record_text_bytes,
-                        (uint64_t)job->prepared->record_text->u8_bytes);
-        if (job->targets != nullptr) {
-            rocs_store_commit_index_targets(job->targets, start + i);
-            n00b_atomic_add(&store->hot_worker_range_commits, 1);
+        if (ready == 0) {
+            return n00b_result_err(uint64_t, prepare_err);
         }
-        if (job->batch_job != nullptr) {
-            rocs_store_zone_observe(store, job->batch_job->record);
-        }
+        count = ready;
     }
 
     if (UINT64_MAX - store->hot_shard->byte_estimate < total_byte_delta) {
@@ -9057,15 +9141,18 @@ rocs_store_ingest_prepared_range_unlocked(
 
     for (uint64_t step = 0; step < count; step++) {
         uint64_t i = reverse_publish ? count - 1 - step : step;
-        n00b_err_t publish_err = rocs_store_hot_publish_ordinal_unlocked(
-            store,
-            store->hot_shard,
-            start + i);
+        n00b_err_t publish_err =
+            rocs_store_fault(N00B_STORE_FAULT_PUBLISH, jobs[i]->record)
+                ? N00B_STORE_ERR_STATE
+                : rocs_store_hot_publish_ordinal_unlocked(store,
+                                                          store->hot_shard,
+                                                          start + i);
         if (publish_err != N00B_STORE_OK) {
             while (begun != 0) {
                 rocs_store_hot_writer_end_unlocked(store);
                 begun--;
             }
+            *committed_out = count;
             return n00b_result_err(uint64_t, publish_err);
         }
     }
@@ -9087,6 +9174,11 @@ rocs_store_ingest_prepared_range_unlocked(
         begun--;
     }
 
+    *committed_out = count;
+    if (tail_held) {
+        return n00b_result_err(uint64_t, prepare_err);
+    }
+
     if (!store->recovering && rocs_store_should_seal_hot(store)) {
         auto seal_r = rocs_store_seal_hot_shard_unlocked(
             store,
@@ -9099,6 +9191,9 @@ rocs_store_ingest_prepared_range_unlocked(
         (void)seal_r;
     }
 
+    if (stopped) {
+        return n00b_result_err(uint64_t, prepare_err);
+    }
     return n00b_result_ok(uint64_t, count);
 }
 
@@ -9187,13 +9282,15 @@ rocs_store_ensure_hot_route_unlocked(n00b_store_t  *store,
 }
 
 static n00b_result_t(bool)
-rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
-                                    n00b_json_node_t             *record,
-                                    n00b_buffer_t                *raw,
-                                    n00b_string_t                *route,
-                                    rocs_store_batch_term_list_t *terms,
-                                    n00b_allocator_t             *allocator)
+rocs_store_ingest_appending_unlocked(n00b_store_t                 *store,
+                                     n00b_json_node_t             *record,
+                                     n00b_buffer_t                *raw,
+                                     n00b_string_t                *route,
+                                     rocs_store_batch_term_list_t *terms,
+                                     n00b_allocator_t             *allocator,
+                                     bool                         *appended)
 {
+    *appended = false;
     if (store == nullptr || record == nullptr || store->hot_shard == nullptr) {
         return n00b_result_err(bool, N00B_STORE_ERR_ARG);
     }
@@ -9226,7 +9323,11 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
     // Write-ahead: durably append the record's source bytes to the current hot
     // shard's journal before the in-memory commit, so a crash before seal can
     // be recovered.  No-op unless the recovery journal is active.
-    auto journal_r = rocs_store_journal_append(store, raw);
+    auto journal_r =
+        rocs_store_journal_active(store)
+                && rocs_store_fault(N00B_STORE_FAULT_JOURNAL, record)
+            ? n00b_result_err(bool, N00B_STORE_ERR_VFS)
+            : rocs_store_journal_append(store, raw);
     if (n00b_result_is_err(journal_r)) {
         return n00b_result_err(bool, n00b_result_get_err(journal_r));
     }
@@ -9247,10 +9348,12 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
     }
     uint64_t ordinal = n00b_result_get(reserve_r);
 
-    auto fill_r = n00b_store_shard_fill_reserved(store->hot_shard,
-                                                 ordinal,
-                                                 record,
-                                                 .raw = raw);
+    auto fill_r = rocs_store_fault(N00B_STORE_FAULT_FILL, record)
+                    ? n00b_result_err(bool, N00B_STORE_SHARD_ERR_STATE)
+                    : n00b_store_shard_fill_reserved(store->hot_shard,
+                                                     ordinal,
+                                                     record,
+                                                     .raw = raw);
     if (n00b_result_is_err(fill_r)) {
         n00b_err_t err = n00b_result_get_err(fill_r);
         (void)n00b_store_shard_cancel_tail_reservation(store->hot_shard,
@@ -9262,6 +9365,8 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
                                    ? N00B_STORE_ERR_STATE
                                    : N00B_STORE_ERR_ARG);
     }
+    // Filled is appended: an error from here on leaves the record stored.
+    *appended = true;
     n00b_string_t *filled_text =
         n00b_list_get(*store->hot_shard->records, (size_t)ordinal);
     if (filled_text != nullptr) {
@@ -9272,9 +9377,11 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
     rocs_store_commit_index_targets(targets, ordinal);
     rocs_store_zone_observe(store, record);
     n00b_err_t publish_err =
-        rocs_store_hot_publish_ordinal_unlocked(store,
-                                                store->hot_shard,
-                                                ordinal);
+        rocs_store_fault(N00B_STORE_FAULT_PUBLISH, record)
+            ? N00B_STORE_ERR_STATE
+            : rocs_store_hot_publish_ordinal_unlocked(store,
+                                                      store->hot_shard,
+                                                      ordinal);
     if (publish_err != N00B_STORE_OK) {
         rocs_store_hot_writer_end_unlocked(store);
         return n00b_result_err(bool, publish_err);
@@ -9328,6 +9435,24 @@ rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
     }
 
     return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(bool)
+rocs_store_ingest_prepared_unlocked(n00b_store_t                 *store,
+                                    n00b_json_node_t             *record,
+                                    n00b_buffer_t                *raw,
+                                    n00b_string_t                *route,
+                                    rocs_store_batch_term_list_t *terms,
+                                    n00b_allocator_t             *allocator)
+{
+    bool appended;
+    return rocs_store_ingest_appending_unlocked(store,
+                                                record,
+                                                raw,
+                                                route,
+                                                terms,
+                                                allocator,
+                                                &appended);
 }
 
 n00b_string_t *
@@ -12626,6 +12751,7 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
             }
 
             if (run != 0) {
+                uint64_t range_committed = 0;
                 auto range_r = rocs_store_ingest_prepared_range_unlocked(
                     store,
                     &jobs[i],
@@ -12637,7 +12763,10 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                     worker_pool,
                     workers,
                     prep_queue_capacity,
-                    true);
+                    true,
+                    &range_committed);
+                committed += range_committed;
+                i += range_committed;
                 if (n00b_result_is_err(range_r)) {
                     n00b_err_t err = n00b_result_get_err(range_r);
                     bool failed_seals_changed =
@@ -12653,9 +12782,6 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
                     }
                     ROCS_BATCH_RETURN(n00b_result_err(uint64_t, err));
                 }
-                uint64_t range_committed = n00b_result_get(range_r);
-                committed += range_committed;
-                i += range_committed;
                 if (rocs_store_failed_seal_job_count(store)
                     != failed_seals_before) {
                     n00b_err_t seal_err = rocs_store_failed_seal_last_error(
@@ -12667,12 +12793,14 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
             }
         }
 
-        auto ingest_r = rocs_store_ingest_prepared_unlocked(store,
-                                                            jobs[i]->record,
-                                                            jobs[i]->raw,
-                                                            jobs[i]->route,
-                                                            jobs[i]->terms,
-                                                            scratch_allocator);
+        bool appended = false;
+        auto ingest_r = rocs_store_ingest_appending_unlocked(store,
+                                                             jobs[i]->record,
+                                                             jobs[i]->raw,
+                                                             jobs[i]->route,
+                                                             jobs[i]->terms,
+                                                             scratch_allocator,
+                                                             &appended);
         if (n00b_result_is_err(ingest_r)) {
             n00b_err_t err = n00b_result_get_err(ingest_r);
             /*
@@ -12690,8 +12818,12 @@ rocs_store_ingest_batch_common(n00b_store_t             *store,
             /*
              * result_t cannot carry both an error and a committed prefix.
              * Once any prefix is visible, the batch retry contract is
-             * Ok(committed); callers resume from that index.
+             * Ok(committed); callers resume from that index. A record that
+             * failed after it was appended is part of that prefix.
              */
+            if (appended) {
+                committed++;
+            }
             if (committed != 0) {
                 ROCS_BATCH_RETURN(n00b_result_ok(uint64_t, committed));
             }
