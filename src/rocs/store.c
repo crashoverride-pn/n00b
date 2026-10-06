@@ -10050,6 +10050,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     n00b_plan_cancel_fn  cancel_cb    = nullptr;
     void                *cancel_ctx   = nullptr;
     uint64_t             result_limit = UINT64_MAX;
+    bool                 reverse      = false;
 }
 {
     if (store == nullptr || predicate == nullptr) {
@@ -10178,7 +10179,8 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                          .cancel_ctx    = cancel_ctx,
                                          .record_limit  = record_limit,
                                          .first_ordinal = first_ordinal,
-                                         .result_limit  = result_limit);
+                                         .result_limit  = result_limit,
+                                         .reverse       = reverse);
     if (n00b_result_is_err(ordinals_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
@@ -10188,9 +10190,10 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
 
     n00b_plan_ordset_t *ordinals = n00b_result_get(ordinals_r);
     uint64_t kept = 0;
-    uint64_t from = first_ordinal;
+    uint64_t from = reverse ? record_limit - 1 : first_ordinal;
     while (kept < result_limit) {
-        auto ordinal_r = n00b_plan_ordset_next(ordinals, from);
+        auto ordinal_r = reverse ? n00b_plan_ordset_prev(ordinals, from)
+                                 : n00b_plan_ordset_next(ordinals, from);
         if (n00b_result_is_err(ordinal_r)) {
             n00b_plan_ordset_free(ordinals);
             n00b_pinref_unpin(&store->hot_pin);
@@ -10204,7 +10207,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
             break;
         }
         uint64_t ordinal = n00b_option_get(ordinal_opt);
-        if (ordinal >= record_limit) {
+        if (ordinal >= record_limit || ordinal < first_ordinal) {
             break;
         }
         // Polled per match copied, on the first and every 1024 after.
@@ -10223,9 +10226,26 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
         };
         n00b_list_push(*scan.matches, pos);
         kept++;
-        from = ordinal + 1;
+        if (reverse) {
+            if (ordinal == 0) {
+                break;
+            }
+            from = ordinal - 1;
+        }
+        else {
+            from = ordinal + 1;
+        }
     }
-    if (kept == result_limit && kept != 0) {
+    if (reverse) {
+        // Collected descending; callers read matches ascending.
+        for (uint64_t i = 0, j = kept; i + 1 < j; i++, j--) {
+            n00b_store_pos_t low  = n00b_list_get(*scan.matches, (size_t)i);
+            n00b_store_pos_t high = n00b_list_get(*scan.matches, (size_t)(j - 1));
+            n00b_list_set(*scan.matches, (size_t)i, high);
+            n00b_list_set(*scan.matches, (size_t)(j - 1), low);
+        }
+    }
+    else if (kept == result_limit && kept != 0) {
         last         = n00b_list_get(*scan.matches, (size_t)(kept - 1));
         record_limit = last.ordinal + 1;
     }

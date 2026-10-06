@@ -408,6 +408,22 @@ n00b_query_records_read(void);
 
 extern void
 n00b_query_records_read_reset(void);
+
+// Aggregate rows built since the last reset, one per group a query kept at
+// some point.
+extern uint64_t
+n00b_query_agg_rows_built(void);
+
+extern void
+n00b_query_agg_rows_built_reset(void);
+
+// Boundaries n00b_query_linear_cursor_seek compared against since the last
+// reset.
+extern uint64_t
+n00b_query_linear_seek_steps(void);
+
+extern void
+n00b_query_linear_seek_steps_reset(void);
 #endif
 
 /**

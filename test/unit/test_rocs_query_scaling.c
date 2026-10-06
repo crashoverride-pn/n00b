@@ -829,6 +829,224 @@ test_linear_cursor_steps_in_place(n00b_store_t *store)
     n00b_allocator_destroy(alloc.allocator);
 }
 
+// The position a linear cursor reports after its last next or prev.
+static n00b_store_pos_t
+linear_position(n00b_query_linear_cursor_t *cursor)
+{
+    auto pos_r = n00b_query_linear_cursor_position(cursor);
+    CHECK(n00b_result_is_ok(pos_r));
+    CHECK(n00b_option_is_set(n00b_result_get(pos_r)));
+    return n00b_option_get(n00b_result_get(pos_r));
+}
+
+static bool
+linear_step(n00b_result_t(n00b_option_t(n00b_query_hit_t *)) step_r)
+{
+    CHECK(n00b_result_is_ok(step_r));
+    return n00b_option_is_set(n00b_result_get(step_r));
+}
+
+// After a seek to any record, next lands on the record after it and prev on
+// the record itself, as a full walk orders them. Probed at the first, middle,
+// and last record of every shard, and past the last record of the store.
+static void
+test_linear_seek_matches_a_walk(n00b_store_t *store)
+{
+    auto view_r = n00b_query_view(store, nullptr);
+    CHECK(n00b_result_is_ok(view_r));
+    n00b_query_view_t *view = n00b_result_get(view_r);
+    auto cursor_r = n00b_query_linear_cursor(view);
+    CHECK(n00b_result_is_ok(cursor_r));
+    n00b_query_linear_cursor_t *cursor = n00b_result_get(cursor_r);
+
+    n00b_store_pos_t *walk = n00b_alloc_array(n00b_store_pos_t, MANY_RECORDS);
+    uint64_t          n    = 0;
+    while (linear_step(n00b_query_linear_cursor_next(cursor))) {
+        CHECK(n < MANY_RECORDS);
+        walk[n++] = linear_position(cursor);
+    }
+    CHECK(n == MANY_RECORDS);
+
+    uint64_t probes[] = {0, MANY_PER_SHARD / 2, MANY_PER_SHARD - 1};
+    for (uint64_t s = 0; s < MANY_SHARDS; s++) {
+        for (size_t k = 0; k < sizeof(probes) / sizeof(probes[0]); k++) {
+            uint64_t i = s * MANY_PER_SHARD + probes[k];
+
+            CHECK(n00b_result_is_ok(
+                n00b_query_linear_cursor_seek(cursor, walk[i])));
+            bool more = linear_step(n00b_query_linear_cursor_next(cursor));
+            CHECK(more == (i + 1 < n));
+            if (more) {
+                CHECK(n00b_store_pos_compare(linear_position(cursor),
+                                             walk[i + 1])
+                      == 0);
+            }
+
+            CHECK(n00b_result_is_ok(
+                n00b_query_linear_cursor_seek(cursor, walk[i])));
+            CHECK(linear_step(n00b_query_linear_cursor_prev(cursor)));
+            CHECK(n00b_store_pos_compare(linear_position(cursor), walk[i])
+                  == 0);
+        }
+    }
+
+    n00b_store_pos_t past = walk[n - 1];
+    past.ordinal++;
+    CHECK(n00b_result_is_ok(n00b_query_linear_cursor_seek(cursor, past)));
+    CHECK(!linear_step(n00b_query_linear_cursor_next(cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_linear_cursor_seek(cursor, past)));
+    CHECK(linear_step(n00b_query_linear_cursor_prev(cursor)));
+    CHECK(n00b_store_pos_compare(linear_position(cursor), walk[n - 1]) == 0);
+
+    CHECK(n00b_result_is_ok(n00b_query_linear_cursor_close(cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
+}
+
+// A seek finds its boundary in O(log shards) comparisons, wherever the
+// position falls.
+static void
+test_linear_seek_compares_log_boundaries(n00b_store_t *store)
+{
+    auto view_r = n00b_query_view(store, nullptr);
+    CHECK(n00b_result_is_ok(view_r));
+    n00b_query_view_t *view = n00b_result_get(view_r);
+    auto cursor_r = n00b_query_linear_cursor(view);
+    CHECK(n00b_result_is_ok(cursor_r));
+    n00b_query_linear_cursor_t *cursor = n00b_result_get(cursor_r);
+
+    CHECK(linear_step(n00b_query_linear_cursor_next(cursor)));
+    n00b_store_pos_t first = linear_position(cursor);
+
+    n00b_query_linear_seek_steps_reset();
+    CHECK(n00b_result_is_ok(n00b_query_linear_cursor_seek(cursor, first)));
+    uint64_t steps = n00b_query_linear_seek_steps();
+
+    printf("  linear seek to the first of %d shards: boundaries compared=%llu\n",
+           MANY_SHARDS,
+           (unsigned long long)steps);
+    // ceil(log2(24)) + 1.
+    CHECK(steps <= 6);
+
+    CHECK(n00b_result_is_ok(n00b_query_linear_cursor_close(cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
+}
+
+// A grouped aggregate under a limit builds rows only for groups it can still
+// report. Ids arrive in ascending order and the smallest are reported, so
+// grouping 12,000 distinct ids under limit 5 builds 5.
+static void
+test_grouped_limit_builds_only_reported_rows(n00b_store_t *store)
+{
+    n00b_query_group_by_list_t *groups =
+        n00b_alloc(n00b_query_group_by_list_t);
+    *groups = n00b_list_new_private(n00b_filter_field_t *,
+                                    .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    n00b_list_push(*groups, field_ok(r"id"));
+
+    n00b_query_agg_rows_built_reset();
+    n00b_query_result_t *grouped = run_ok(
+        store,
+        query_ok(n00b_query_new(contains(r"alpha"),
+                                .group_by   = groups,
+                                .aggregates = agg_list(N00B_QUERY_AGG_COUNT,
+                                                       nullptr),
+                                .limit      = 5)));
+    uint64_t built = n00b_query_agg_rows_built();
+
+    printf("  grouped COUNT over %d distinct ids, limit 5: rows built=%llu\n",
+           MANY_RECORDS,
+           (unsigned long long)built);
+    CHECK(n00b_query_count(grouped) == 5);
+    CHECK(built == 5);
+    close_result(grouped);
+}
+
+// A linear cursor over a hot boundary whose shard sealed after the view was
+// taken reads the boundary from the sealed image, in either direction.
+static void
+test_linear_hot_records_sealed_after_view(bool reverse)
+{
+    n00b_store_t *store = open_store(0, 0);
+    for (int64_t id = 0; id < MANY_PER_SHARD; id++) {
+        ingest(store, id);
+    }
+
+    auto view_r = n00b_query_view(store, nullptr);
+    CHECK(n00b_result_is_ok(view_r));
+    n00b_query_view_t *view = n00b_result_get(view_r);
+    auto cursor_r = n00b_query_linear_cursor(view, .reverse = reverse);
+    CHECK(n00b_result_is_ok(cursor_r));
+    n00b_query_linear_cursor_t *cursor = n00b_result_get(cursor_r);
+
+    auto seal_r = n00b_store_seal_hot_shard(store, .seal_ts = 2000);
+    CHECK(n00b_result_is_ok(seal_r));
+
+    uint64_t delivered = 0;
+    while (true) {
+        auto next_r = n00b_query_linear_cursor_next(cursor);
+        CHECK(n00b_result_is_ok(next_r));
+        if (!n00b_option_is_set(n00b_result_get(next_r))) {
+            break;
+        }
+        int64_t want = reverse ? (int64_t)(MANY_PER_SHARD - 1 - delivered)
+                               : (int64_t)delivered;
+        CHECK(hit_id(n00b_option_get(n00b_result_get(next_r))) == want);
+        delivered++;
+    }
+
+    printf("  linear walk of a hot shard sealed after the view (%s): "
+           "delivered=%llu of %d\n",
+           reverse ? "reverse" : "forward",
+           (unsigned long long)delivered,
+           MANY_PER_SHARD);
+    CHECK(delivered == MANY_PER_SHARD);
+    CHECK(n00b_result_is_ok(n00b_query_linear_cursor_close(cursor)));
+    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
+    CHECK(active_pins(store) == 0);
+}
+
+// The same over hot records: a limited walk verifies records only until the
+// limit is met, from whichever end the cursor starts.
+static void
+test_limit_stops_hot_residual_scan(void)
+{
+    n00b_store_t *store = open_store(0, 0);
+    for (int64_t id = 0; id < BIG_RECORDS; id++) {
+        ingest(store, id);
+    }
+    int64_t ids[PAGE];
+
+    auto view_r = n00b_query_view(store, note_regex(r"timeout"), .limit = PAGE);
+    CHECK(n00b_result_is_ok(view_r));
+    n00b_query_view_t *view = n00b_result_get(view_r);
+
+    n00b_plan_records_scanned_reset();
+    CHECK(walk_ids(view, false, ids, PAGE) == PAGE);
+    uint64_t forward = n00b_plan_records_scanned();
+    for (uint64_t i = 0; i < PAGE; i++) {
+        CHECK(ids[i] == (int64_t)(i * TIMEOUT_EVERY));
+    }
+
+    n00b_plan_records_scanned_reset();
+    CHECK(walk_ids(view, true, ids, PAGE) == PAGE);
+    uint64_t backward = n00b_plan_records_scanned();
+    for (uint64_t i = 0; i < PAGE; i++) {
+        CHECK(ids[i] == (int64_t)(BIG_RECORDS - (i + 1) * TIMEOUT_EVERY));
+    }
+    CHECK(n00b_result_is_ok(n00b_query_view_close(view)));
+
+    printf("  limit %d on %d hot records: records_scanned forward=%llu "
+           "reverse=%llu\n",
+           PAGE,
+           BIG_RECORDS,
+           (unsigned long long)forward,
+           (unsigned long long)backward);
+
+    // The tenth match is the 901st record from either end.
+    CHECK(forward <= PAGE * TIMEOUT_EVERY);
+    CHECK(backward <= PAGE * TIMEOUT_EVERY);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -842,14 +1060,20 @@ main(int argc, char **argv)
     test_limit_stops_inside_indexed_boundary(many);
     test_aggregates_bounded(many);
     test_linear_cursor_steps_in_place(many);
+    test_linear_seek_matches_a_walk(many);
+    test_linear_seek_compares_log_boundaries(many);
+    test_grouped_limit_builds_only_reported_rows(many);
 
     test_hot_records_sealed_mid_walk(false);
     test_hot_records_sealed_mid_walk(true);
     test_hot_records_sealed_before_first_advance(false);
     test_hot_records_sealed_before_first_advance(true);
+    test_linear_hot_records_sealed_after_view(false);
+    test_linear_hot_records_sealed_after_view(true);
 
     n00b_store_t *big = open_store(1, BIG_RECORDS);
     test_limit_stops_residual_scan(big);
+    test_limit_stops_hot_residual_scan();
     test_resume_pages_scan_one_window(big);
 
     n00b_shutdown();

@@ -248,6 +248,9 @@ n00b_store_commit_unsubscribe_for_query(n00b_store_commit_topic_t  *topic,
  *                  returned progress then ends at the last match returned,
  *                  so a later scan after it resumes where this one stopped.
  *                  Zero returns no matches and observes nothing.
+ * @kw reverse Take the last @p result_limit matches at or below `through`
+ *             instead of the first. Matches still come back ascending, and
+ *             the progress reported ends at `through`.
  * @return Ok(scan) with copied matching positions and durable progress, or a
  *         typed store error.
  *
@@ -272,6 +275,7 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     n00b_plan_cancel_fn  cancel_cb    = nullptr;
     void                *cancel_ctx   = nullptr;
     uint64_t             result_limit = UINT64_MAX;
+    bool                 reverse      = false;
 };
 
 /**

@@ -88,8 +88,39 @@ n00b_query_records_read_reset(void)
     atomic_fetch_add_explicit(&rocs_query_records_read,         \
                               1,                                \
                               memory_order_relaxed)
+
+static _Atomic(uint64_t) rocs_query_agg_rows   = 0;
+static _Atomic(uint64_t) rocs_query_seek_steps = 0;
+
+uint64_t
+n00b_query_agg_rows_built(void)
+{
+    return atomic_load_explicit(&rocs_query_agg_rows, memory_order_relaxed);
+}
+
+void
+n00b_query_agg_rows_built_reset(void)
+{
+    atomic_store_explicit(&rocs_query_agg_rows, 0, memory_order_relaxed);
+}
+
+uint64_t
+n00b_query_linear_seek_steps(void)
+{
+    return atomic_load_explicit(&rocs_query_seek_steps, memory_order_relaxed);
+}
+
+void
+n00b_query_linear_seek_steps_reset(void)
+{
+    atomic_store_explicit(&rocs_query_seek_steps, 0, memory_order_relaxed);
+}
+
+#define ROCS_QUERY_COUNT(_counter) \
+    atomic_fetch_add_explicit(&(_counter), 1, memory_order_relaxed)
 #else
 #define ROCS_QUERY_COUNT_RECORD_READ() ((void)0)
+#define ROCS_QUERY_COUNT(_counter)     ((void)0)
 #endif
 #define ROCS_QUERY_HIT_ARENA_SIZE          (UINT64_C(1) << 16)
 #define ROCS_QUERY_BOUNDARY_ARENA_SIZE     (UINT64_C(1) << 20)
@@ -1626,6 +1657,7 @@ rocs_query_row_new(n00b_query_group_key_list_t *keys,
                    n00b_query_agg_spec_list_t  *aggregates,
                    n00b_allocator_t            *allocator)
 {
+    ROCS_QUERY_COUNT(rocs_query_agg_rows);
     n00b_query_agg_row_t *row = n00b_alloc_with_opts(
         n00b_query_agg_row_t,
         &(n00b_alloc_opts_t){
@@ -7985,10 +8017,9 @@ rocs_query_cursor_lazy_begin_hot_boundary(n00b_query_cursor_t        *cursor,
     n00b_store_pos_t after   = boundary.hot_through;
     after.ordinal            = lo == 0 ? 0 : lo - 1;
 
-    // Matches come back ascending, so a limit is only the first matches owed
-    // when the walk is ascending too.
+    // The matches still owed, from the end the walk starts at.
     uint64_t limit = UINT64_MAX;
-    if (!cursor->reverse && cursor->view->limit != 0) {
+    if (cursor->view->limit != 0) {
         limit = cursor->view->limit - cursor->total_delivered;
     }
 
@@ -7999,7 +8030,8 @@ rocs_query_cursor_lazy_begin_hot_boundary(n00b_query_cursor_t        *cursor,
                                                  .through      = &through,
                                                  .cancel_cb    = cursor->cancel_cb,
                                                  .cancel_ctx   = cursor->cancel_ctx,
-                                                 .result_limit = limit);
+                                                 .result_limit = limit,
+                                                 .reverse      = cursor->reverse);
     if (n00b_result_is_err(scan_r)) {
         return n00b_result_err(
             bool,
@@ -10056,6 +10088,58 @@ rocs_query_linear_find_boundary(n00b_query_linear_cursor_t *cursor,
 // the hot boundary yields nothing in `dir`, cross to the next boundary. Returns
 // none (and sets the terminal edge for `dir`) only when no further in-window
 // record exists.
+// A hot position whose shard sealed after the view captured it, read from the
+// sealed image, which keeps the shard's id and ordinals. The image stays
+// pinned as the boundary's resident. None when the shard has left the
+// catalog, as when retention already dropped it.
+static n00b_result_t(n00b_option_t(n00b_store_record_t *))
+rocs_query_linear_hot_sealed_record(n00b_query_linear_cursor_t *cursor,
+                                    uint64_t                    bidx,
+                                    n00b_store_pos_t            pos)
+{
+    if (!cursor->has_resident || cursor->resident_boundary != bidx) {
+        auto release_r = rocs_query_linear_release_resident(cursor);
+        if (n00b_result_is_err(release_r)) {
+            return n00b_result_err(n00b_option_t(n00b_store_record_t *),
+                                   n00b_result_get_err(release_r));
+        }
+        auto entry_r = rocs_query_current_catalog_entry_pos(cursor->view,
+                                                            pos,
+                                                            cursor->allocator);
+        if (n00b_result_is_err(entry_r)) {
+            return n00b_result_ok(n00b_option_t(n00b_store_record_t *),
+                                  n00b_option_none(n00b_store_record_t *));
+        }
+        n00b_store_resident_shard_t *resident = nullptr;
+        auto root_r = rocs_query_resident_root(cursor->view,
+                                               n00b_result_get(entry_r),
+                                               &resident,
+                                               cursor->allocator);
+        if (n00b_result_is_err(root_r)) {
+            return n00b_result_err(n00b_option_t(n00b_store_record_t *),
+                                   n00b_result_get_error(root_r));
+        }
+        cursor->resident          = resident;
+        cursor->root              = n00b_result_get(root_r);
+        cursor->resident_boundary = bidx;
+        cursor->has_resident      = true;
+    }
+
+    auto record_r = n00b_store_record_view_mapped_pos(
+        cursor->root,
+        pos,
+        .allocator = (n00b_allocator_t *)cursor->hit_arena);
+    ROCS_QUERY_COUNT_RECORD_READ();
+    if (n00b_result_is_err(record_r)) {
+        return n00b_result_err(
+            n00b_option_t(n00b_store_record_t *),
+            rocs_query_err_from_index(n00b_result_get_err(record_r)));
+    }
+    return n00b_result_ok(n00b_option_t(n00b_store_record_t *),
+                          n00b_option_set(n00b_store_record_t *,
+                                          n00b_result_get(record_r)));
+}
+
 static n00b_result_t(n00b_option_t(n00b_query_hit_t *))
 rocs_query_linear_emit_dir(n00b_query_linear_cursor_t *cursor,
                            uint64_t                    bidx,
@@ -10069,12 +10153,14 @@ rocs_query_linear_emit_dir(n00b_query_linear_cursor_t *cursor,
             return rocs_query_linear_emit(cursor, bidx, ordinal);
         }
 
-        // Hot boundary: not backed by a sealed mmap image, so drop any resident
-        // pin held for a prior sealed boundary before reading hot records.
-        auto release_r = rocs_query_linear_release_resident(cursor);
-        if (n00b_result_is_err(release_r)) {
-            return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
-                                   n00b_result_get_err(release_r));
+        // A pin held for another boundary goes before this one is read. A pin
+        // on this boundary is its sealed image, kept while the walk stays here.
+        if (cursor->has_resident && cursor->resident_boundary != bidx) {
+            auto release_r = rocs_query_linear_release_resident(cursor);
+            if (n00b_result_is_err(release_r)) {
+                return n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                       n00b_result_get_err(release_r));
+            }
         }
 
         uint64_t first = 0;
@@ -10103,6 +10189,11 @@ rocs_query_linear_emit_dir(n00b_query_linear_cursor_t *cursor,
                 }
                 n00b_option_t(n00b_store_record_t *) rec_opt =
                     n00b_result_get(rec_r);
+                if (!n00b_option_is_set(rec_opt)) {
+                    rec_opt = rocs_query_linear_hot_sealed_record(cursor,
+                                                                  bidx,
+                                                                  pos)!;
+                }
                 if (n00b_option_is_set(rec_opt)) {
                     return rocs_query_linear_finish_emit(cursor,
                                                          bidx,
@@ -10110,7 +10201,7 @@ rocs_query_linear_emit_dir(n00b_query_linear_cursor_t *cursor,
                                                          pos,
                                                          n00b_option_get(rec_opt));
                 }
-                // Gone (sealed+rotated since the snapshot): skip in `dir`.
+                // Gone from the catalog as well: skip in `dir`.
                 if (dir > 0) {
                     if (o >= last) {
                         break;
@@ -10432,6 +10523,7 @@ n00b_query_linear_cursor_seek(n00b_query_linear_cursor_t *cursor,
     int64_t lo     = 0;
     int64_t hi     = count - 1;
     while (lo <= hi) {
+        ROCS_QUERY_COUNT(rocs_query_seek_steps);
         int64_t mid = lo + (hi - lo) / 2;
         n00b_query_boundary_entry_t boundary =
             n00b_list_get(*cursor->view->boundary, (size_t)mid);
@@ -11151,7 +11243,10 @@ rocs_query_cursor_built_positions(n00b_query_cursor_t *cursor)
         }
         rocs_query_cursor_lazy_teardown(walk);
 
+        // The cursor reports the same first error from every later call,
+        // whichever call met it.
         if (failed) {
+            rocs_query_cursor_fail(cursor, error);
             return n00b_result_err(rocs_query_pos_list_t *, error);
         }
         cursor->built_positions = positions;
