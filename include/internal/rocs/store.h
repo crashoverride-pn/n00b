@@ -244,6 +244,10 @@ n00b_store_commit_unsubscribe_for_query(n00b_store_commit_topic_t  *topic,
  *               @c N00B_STORE_ERR_CANCELED and releases the hot pin.
  *               Borrowed; may be nullptr.
  * @kw cancel_ctx Opaque context passed to @p cancel_cb. Borrowed.
+ * @kw result_limit Stop after this many matches in ascending order. The
+ *                  returned progress then ends at the last match returned,
+ *                  so a later scan after it resumes where this one stopped.
+ *                  Zero returns no matches and observes nothing.
  * @return Ok(scan) with copied matching positions and durable progress, or a
  *         typed store error.
  *
@@ -263,10 +267,11 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_plan_predicate_t *predicate,
                                n00b_store_pos_t      *after) _kargs
 {
-    n00b_allocator_t    *allocator  = nullptr;
-    n00b_store_pos_t    *through    = nullptr;
-    n00b_plan_cancel_fn  cancel_cb  = nullptr;
-    void                *cancel_ctx = nullptr;
+    n00b_allocator_t    *allocator    = nullptr;
+    n00b_store_pos_t    *through      = nullptr;
+    n00b_plan_cancel_fn  cancel_cb    = nullptr;
+    void                *cancel_ctx   = nullptr;
+    uint64_t             result_limit = UINT64_MAX;
 };
 
 /**
@@ -364,6 +369,22 @@ n00b_store_catalog_visible_entry_count(n00b_store_t *store);
  */
 extern n00b_result_t(n00b_option_t(n00b_store_catalog_entry_t *))
 n00b_store_catalog_visible_entry_at(n00b_store_t *store, uint64_t index);
+
+typedef n00b_list_t(n00b_store_catalog_entry_t *)
+    n00b_store_catalog_entry_list_t;
+
+/**
+ * @brief Borrow every catalog-visible sealed shard, in catalog order, in one
+ *        pass.
+ *
+ * Same borrowing rules as @ref n00b_store_catalog_visible_entry_at, which
+ * costs a catalog scan per call.
+ */
+extern n00b_result_t(n00b_store_catalog_entry_list_t *)
+n00b_store_catalog_visible_entries(n00b_store_t *store) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+};
 
 /**
  * @brief Copy the catalog-visible sealed entries of one catalog version.

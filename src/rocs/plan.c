@@ -285,62 +285,132 @@ _rocs_plan_check_children(n00b_plan_predicate_list_t *children)
 }
 
 static n00b_result_t(uint64_t)
-_rocs_plan_ordset_byte_count(uint64_t record_count)
+_rocs_plan_ordset_word_count(uint64_t record_count)
 {
-    uint64_t bytes = record_count >> 3;
-    if ((record_count & UINT64_C(7)) != 0) {
-        bytes++;
+    uint64_t words = record_count >> 6;
+    if ((record_count & UINT64_C(63)) != 0) {
+        words++;
     }
-    if (bytes > (uint64_t)INT64_MAX) {
+    if (words > (uint64_t)SIZE_MAX / sizeof(uint64_t)) {
         return n00b_result_err(uint64_t, N00B_PLAN_ERR_ARG);
     }
-    return n00b_result_ok(uint64_t, bytes);
+    return n00b_result_ok(uint64_t, words);
 }
 
-static uint8_t
+// Members of the last word; every word before it is fully in the universe.
+static uint64_t
 _rocs_plan_ordset_tail_mask(uint64_t record_count)
 {
-    uint64_t bits = record_count & UINT64_C(7);
+    uint64_t bits = record_count & UINT64_C(63);
     if (bits == 0) {
-        return UINT8_MAX;
+        return UINT64_MAX;
     }
-    return (uint8_t)((UINT32_C(1) << bits) - UINT32_C(1));
+    return (UINT64_C(1) << bits) - UINT64_C(1);
 }
 
-static uint64_t
-_rocs_plan_ordset_popcount_byte(uint8_t byte)
+#ifdef N00B_DEBUG
+static _Atomic(uint64_t) rocs_ordset_bitmaps_allocated = 0;
+static _Atomic(uint64_t) rocs_ordset_bitmaps_freed     = 0;
+
+uint64_t
+n00b_plan_ordset_bitmaps_allocated(void)
 {
-    uint64_t count = 0;
-    for (uint8_t bit = 0; bit < 8; bit++) {
-        if ((byte & (uint8_t)(UINT8_C(1) << bit)) != 0) {
-            count++;
-        }
-    }
-    return count;
+    return atomic_load_explicit(&rocs_ordset_bitmaps_allocated,
+                                memory_order_relaxed);
 }
 
-// Materialize a lazily-allocated bitmap. Empty sets carry bits == nullptr:
+uint64_t
+n00b_plan_ordset_bitmaps_freed(void)
+{
+    return atomic_load_explicit(&rocs_ordset_bitmaps_freed,
+                                memory_order_relaxed);
+}
+
+void
+n00b_plan_ordset_bitmaps_reset(void)
+{
+    atomic_store_explicit(&rocs_ordset_bitmaps_allocated,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&rocs_ordset_bitmaps_freed, 0, memory_order_relaxed);
+}
+#endif
+
+static void
+_rocs_plan_ordset_free_storage(n00b_allocator_t *allocator, void *ptr)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+    if (allocator != nullptr) {
+        n00b_free(ptr, .allocator = allocator);
+    }
+    else {
+        n00b_free(ptr);
+    }
+}
+
+// Any change to membership invalidates the ascending-ordinal cache.
+static void
+_rocs_plan_ordset_drop_cache(n00b_plan_ordset_t *set)
+{
+    _rocs_plan_ordset_free_storage(set->allocator, set->ord_cache);
+    set->ord_cache = nullptr;
+}
+
+static void
+_rocs_plan_ordset_drop_words(n00b_plan_ordset_t *set)
+{
+    if (set->words != nullptr) {
+#ifdef N00B_DEBUG
+        atomic_fetch_add_explicit(&rocs_ordset_bitmaps_freed,
+                                  1,
+                                  memory_order_relaxed);
+#endif
+        _rocs_plan_ordset_free_storage(set->allocator, set->words);
+        set->words      = nullptr;
+        set->word_count = 0;
+    }
+    set->count = 0;
+    _rocs_plan_ordset_drop_cache(set);
+}
+
+// Materialize a lazily-allocated bitmap. Empty sets carry words == nullptr:
 // query plans build one ordset per (shard, disjunct) and in a whole-store
 // walk nearly all of them stay empty, so eagerly mapping a record_count-sized
-// buffer for each dominated the walk (one mmap-registered buffer per empty
-// set, plus one registry teardown per buffer at request end).
+// buffer for each dominated the walk.
 static n00b_result_t(bool)
 _rocs_plan_ordset_bits_ensure(n00b_plan_ordset_t *set)
 {
-    if (set->bits != nullptr) {
+    if (set->words != nullptr) {
         return n00b_result_ok(bool, true);
     }
 
-    auto bytes_r = _rocs_plan_ordset_byte_count(set->record_count);
-    if (n00b_result_is_err(bytes_r)) {
-        return n00b_result_err(bool, n00b_result_get_err(bytes_r));
+    auto words_r = _rocs_plan_ordset_word_count(set->record_count);
+    if (n00b_result_is_err(words_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(words_r));
     }
-
-    set->bits = n00b_buffer_new((int64_t)n00b_result_get(bytes_r),
-                                .allocator = set->allocator);
-    if (set->bits == nullptr) {
+    uint64_t words = n00b_result_get(words_r);
+    if (words == 0) {
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
     }
+
+    set->words = n00b_alloc_array_with_opts(
+        uint64_t,
+        (size_t)words,
+        &(n00b_alloc_opts_t){
+            .allocator = set->allocator,
+            .scan_kind = N00B_GC_SCAN_KIND_NONE,
+        });
+    if (set->words == nullptr) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
+    }
+    set->word_count = words;
+#ifdef N00B_DEBUG
+    atomic_fetch_add_explicit(&rocs_ordset_bitmaps_allocated,
+                              1,
+                              memory_order_relaxed);
+#endif
     return n00b_result_ok(bool, true);
 }
 
@@ -351,24 +421,17 @@ _rocs_plan_ordset_check(n00b_plan_ordset_t *set)
         return n00b_result_err(bool, N00B_PLAN_ERR_ARG);
     }
 
-    auto bytes_r = _rocs_plan_ordset_byte_count(set->record_count);
-    if (n00b_result_is_err(bytes_r)) {
+    auto words_r = _rocs_plan_ordset_word_count(set->record_count);
+    if (n00b_result_is_err(words_r)) {
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
     }
 
-    if (set->bits == nullptr) {
-        // Lazily-allocated set: valid only while empty. count > 0 always
-        // materializes the bitmap first (see _rocs_plan_ordset_bits_ensure).
-        if (set->count != 0) {
-            return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
-        }
-        return n00b_result_ok(bool, true);
-    }
-
-    uint64_t bytes = n00b_result_get(bytes_r);
-    if ((uint64_t)set->bits->byte_len != bytes
-        || (bytes != 0 && set->bits->data == nullptr)
-        || set->count > set->record_count) {
+    // A set without a bitmap is valid only while empty: count > 0 always
+    // materializes the bitmap first (see _rocs_plan_ordset_bits_ensure).
+    if (set->count > set->record_count
+        || (set->words == nullptr && set->count != 0)
+        || (set->words != nullptr
+            && set->word_count != n00b_result_get(words_r))) {
         return n00b_result_err(bool, N00B_PLAN_ERR_STATE);
     }
 
@@ -378,29 +441,25 @@ _rocs_plan_ordset_check(n00b_plan_ordset_t *set)
 static bool
 _rocs_plan_ordset_bit_is_set(n00b_plan_ordset_t *set, uint64_t ordinal)
 {
-    if (set->bits == nullptr) {
+    if (set->words == nullptr) {
         return false;
     }
-    uint64_t byte_ix = ordinal >> 3;
-    uint8_t  mask    = (uint8_t)(UINT8_C(1) << (ordinal & UINT64_C(7)));
-    return (((uint8_t)set->bits->data[byte_ix]) & mask) != 0;
+    return ((set->words[ordinal >> 6] >> (ordinal & UINT64_C(63))) & 1) != 0;
 }
 
 static bool
 _rocs_plan_ordset_bit_insert(n00b_plan_ordset_t *set, uint64_t ordinal)
 {
-    uint64_t byte_ix = ordinal >> 3;
-    uint8_t  mask    = (uint8_t)(UINT8_C(1) << (ordinal & UINT64_C(7)));
-    uint8_t  byte    = (uint8_t)set->bits->data[byte_ix];
+    uint64_t *word = &set->words[ordinal >> 6];
+    uint64_t  mask = UINT64_C(1) << (ordinal & UINT64_C(63));
 
-    if ((byte & mask) != 0) {
+    if ((*word & mask) != 0) {
         return false;
     }
 
-    set->bits->data[byte_ix] = (char)(byte | mask);
+    *word |= mask;
     set->count++;
-    // Any in-place mutation invalidates the ascending-ordinal cache.
-    set->ord_cache = nullptr;
+    _rocs_plan_ordset_drop_cache(set);
     return true;
 }
 
@@ -410,13 +469,13 @@ _rocs_plan_ordset_new(uint64_t record_count, bool full) _kargs
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    auto bytes_r = _rocs_plan_ordset_byte_count(record_count);
-    if (n00b_result_is_err(bytes_r)) {
+    auto words_r = _rocs_plan_ordset_word_count(record_count);
+    if (n00b_result_is_err(words_r)) {
         return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(bytes_r));
+                               n00b_result_get_err(words_r));
     }
 
-    uint64_t bytes = n00b_result_get(bytes_r);
+    uint64_t words = n00b_result_get(words_r);
     n00b_plan_ordset_t *set = n00b_alloc_with_opts(
         n00b_plan_ordset_t,
         &(n00b_alloc_opts_t){
@@ -426,28 +485,51 @@ _rocs_plan_ordset_new(uint64_t record_count, bool full) _kargs
     set->count        = 0;
     set->allocator    = allocator;
     set->ord_cache    = nullptr;
-    // The bitmap is allocated lazily on first insert; an empty set never
-    // carries one. See _rocs_plan_ordset_bits_ensure for why.
-    set->bits         = nullptr;
+    set->words        = nullptr;
+    set->word_count   = 0;
 
-    if (full) {
+    if (full && record_count != 0) {
         auto ensure_r = _rocs_plan_ordset_bits_ensure(set);
         if (n00b_result_is_err(ensure_r)) {
             return n00b_result_err(n00b_plan_ordset_t *,
                                    n00b_result_get_err(ensure_r));
         }
-        if (bytes != 0) {
-            for (uint64_t i = 0; i < bytes; i++) {
-                set->bits->data[i] = (char)UINT8_MAX;
-            }
-            if ((record_count & UINT64_C(7)) != 0) {
-                set->bits->data[bytes - 1] =
-                    (char)_rocs_plan_ordset_tail_mask(record_count);
-            }
-        }
-        set->count = record_count;
+        memset(set->words, 0xFF, (size_t)words * sizeof(uint64_t));
+        set->words[words - 1] = _rocs_plan_ordset_tail_mask(record_count);
+        set->count            = record_count;
     }
 
+    return n00b_result_ok(n00b_plan_ordset_t *, set);
+}
+
+n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_ordset_range(uint64_t record_count, uint64_t first) _kargs
+{
+    n00b_allocator_t *allocator = nullptr;
+}
+{
+    auto set_r = _rocs_plan_ordset_new(record_count,
+                                       first == 0,
+                                       .allocator = allocator);
+    if (n00b_result_is_err(set_r) || first == 0 || first >= record_count) {
+        return set_r;
+    }
+
+    n00b_plan_ordset_t *set = n00b_result_get(set_r);
+    auto ensure_r = _rocs_plan_ordset_bits_ensure(set);
+    if (n00b_result_is_err(ensure_r)) {
+        return n00b_result_err(n00b_plan_ordset_t *,
+                               n00b_result_get_err(ensure_r));
+    }
+
+    uint64_t words = (record_count + 63) >> 6;
+    uint64_t lead  = first >> 6;
+    memset(set->words + lead + 1,
+           0xFF,
+           (size_t)(words - lead - 1) * sizeof(uint64_t));
+    set->words[lead]      = UINT64_MAX << (first & UINT64_C(63));
+    set->words[words - 1] &= _rocs_plan_ordset_tail_mask(record_count);
+    set->count            = record_count - first;
     return n00b_result_ok(n00b_plan_ordset_t *, set);
 }
 
@@ -473,13 +555,58 @@ _rocs_plan_ordset_clone(n00b_plan_ordset_t *set) _kargs
             return n00b_result_err(n00b_plan_ordset_t *,
                                    n00b_result_get_err(ensure_r));
         }
-        memcpy(out->bits->data,
-               set->bits->data,
-               (size_t)set->bits->byte_len);
+        memcpy(out->words,
+               set->words,
+               (size_t)((set->record_count + 63) >> 6) * sizeof(uint64_t));
         out->count = set->count;
     }
 
     return n00b_result_ok(n00b_plan_ordset_t *, out);
+}
+
+static uint64_t
+_rocs_plan_ordset_apply(uint64_t                      *out,
+                        const uint64_t                *left,
+                        const uint64_t                *right,
+                        uint64_t                       words,
+                        _rocs_plan_ordset_binary_op_t  op)
+{
+    uint64_t count = 0;
+    for (uint64_t i = 0; i < words; i++) {
+        uint64_t v = 0;
+        switch (op) {
+        case _rocs_plan_ordset_op_union:
+            v = left[i] | right[i];
+            break;
+        case _rocs_plan_ordset_op_intersection:
+            v = left[i] & right[i];
+            break;
+        case _rocs_plan_ordset_op_difference:
+            v = left[i] & ~right[i];
+            break;
+        }
+        out[i] = v;
+        count += (uint64_t)__builtin_popcountll(v);
+    }
+    return count;
+}
+
+static n00b_result_t(bool)
+_rocs_plan_ordset_check_pair(n00b_plan_ordset_t *left,
+                             n00b_plan_ordset_t *right)
+{
+    auto left_ok = _rocs_plan_ordset_check(left);
+    if (n00b_result_is_err(left_ok)) {
+        return left_ok;
+    }
+    auto right_ok = _rocs_plan_ordset_check(right);
+    if (n00b_result_is_err(right_ok)) {
+        return right_ok;
+    }
+    if (left->record_count != right->record_count) {
+        return n00b_result_err(bool, N00B_PLAN_ERR_UNIVERSE);
+    }
+    return n00b_result_ok(bool, true);
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
@@ -490,19 +617,10 @@ _rocs_plan_ordset_binary(n00b_plan_ordset_t             *left,
     n00b_allocator_t *allocator = nullptr;
 }
 {
-    auto left_ok = _rocs_plan_ordset_check(left);
-    if (n00b_result_is_err(left_ok)) {
+    auto pair_ok = _rocs_plan_ordset_check_pair(left, right);
+    if (n00b_result_is_err(pair_ok)) {
         return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(left_ok));
-    }
-    auto right_ok = _rocs_plan_ordset_check(right);
-    if (n00b_result_is_err(right_ok)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(right_ok));
-    }
-    if (left->record_count != right->record_count) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               N00B_PLAN_ERR_UNIVERSE);
+                               n00b_result_get_err(pair_ok));
     }
 
     // Empty operands take the allocation-free path. A whole-store walk builds
@@ -538,42 +656,101 @@ _rocs_plan_ordset_binary(n00b_plan_ordset_t             *left,
         return out_r;
     }
 
-    n00b_plan_ordset_t *out = n00b_result_get(out_r);
-    {
-        auto ensure_r = _rocs_plan_ordset_bits_ensure(out);
-        if (n00b_result_is_err(ensure_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   n00b_result_get_err(ensure_r));
-        }
+    n00b_plan_ordset_t *out      = n00b_result_get(out_r);
+    auto                ensure_r = _rocs_plan_ordset_bits_ensure(out);
+    if (n00b_result_is_err(ensure_r)) {
+        return n00b_result_err(n00b_plan_ordset_t *,
+                               n00b_result_get_err(ensure_r));
     }
-    uint64_t bytes = (uint64_t)left->bits->byte_len;
-    uint64_t            count = 0;
-    for (uint64_t i = 0; i < bytes; i++) {
-        uint8_t l = (uint8_t)left->bits->data[i];
-        uint8_t r = (uint8_t)right->bits->data[i];
-        uint8_t v = 0;
-
-        switch (op) {
-        case _rocs_plan_ordset_op_union:
-            v = (uint8_t)(l | r);
-            break;
-        case _rocs_plan_ordset_op_intersection:
-            v = (uint8_t)(l & r);
-            break;
-        case _rocs_plan_ordset_op_difference:
-            v = (uint8_t)(l & (uint8_t)~r);
-            break;
-        }
-
-        if (i + 1 == bytes && (out->record_count & UINT64_C(7)) != 0) {
-            v &= _rocs_plan_ordset_tail_mask(out->record_count);
-        }
-        out->bits->data[i] = (char)v;
-        count += _rocs_plan_ordset_popcount_byte(v);
+    out->count = _rocs_plan_ordset_apply(out->words,
+                                         left->words,
+                                         right->words,
+                                         (left->record_count + 63) >> 6,
+                                         op);
+    if (out->count == 0) {
+        _rocs_plan_ordset_drop_words(out);
     }
-
-    out->count = count;
     return n00b_result_ok(n00b_plan_ordset_t *, out);
+}
+
+n00b_result_t(bool)
+_rocs_plan_ordset_and_into(n00b_plan_ordset_t *dst, n00b_plan_ordset_t *src)
+{
+    auto pair_ok = _rocs_plan_ordset_check_pair(dst, src);
+    if (n00b_result_is_err(pair_ok)) {
+        return pair_ok;
+    }
+    if (dst == src || dst->count == 0) {
+        return n00b_result_ok(bool, true);
+    }
+    if (src->count == 0) {
+        _rocs_plan_ordset_drop_words(dst);
+        return n00b_result_ok(bool, true);
+    }
+
+    dst->count = _rocs_plan_ordset_apply(dst->words,
+                                         dst->words,
+                                         src->words,
+                                         (dst->record_count + 63) >> 6,
+                                         _rocs_plan_ordset_op_intersection);
+    _rocs_plan_ordset_drop_cache(dst);
+    if (dst->count == 0) {
+        _rocs_plan_ordset_drop_words(dst);
+    }
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+_rocs_plan_ordset_or_into(n00b_plan_ordset_t *dst, n00b_plan_ordset_t *src)
+{
+    auto pair_ok = _rocs_plan_ordset_check_pair(dst, src);
+    if (n00b_result_is_err(pair_ok)) {
+        return pair_ok;
+    }
+    if (dst == src || src->count == 0) {
+        return n00b_result_ok(bool, true);
+    }
+
+    auto ensure_r = _rocs_plan_ordset_bits_ensure(dst);
+    if (n00b_result_is_err(ensure_r)) {
+        return ensure_r;
+    }
+    dst->count = _rocs_plan_ordset_apply(dst->words,
+                                         dst->words,
+                                         src->words,
+                                         (dst->record_count + 63) >> 6,
+                                         _rocs_plan_ordset_op_union);
+    _rocs_plan_ordset_drop_cache(dst);
+    return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+_rocs_plan_ordset_complement_in_place(n00b_plan_ordset_t *set)
+{
+    auto ok = _rocs_plan_ordset_check(set);
+    if (n00b_result_is_err(ok)) {
+        return ok;
+    }
+    if (set->record_count == 0) {
+        return n00b_result_ok(bool, true);
+    }
+
+    auto ensure_r = _rocs_plan_ordset_bits_ensure(set);
+    if (n00b_result_is_err(ensure_r)) {
+        return ensure_r;
+    }
+
+    uint64_t words = (set->record_count + 63) >> 6;
+    for (uint64_t i = 0; i < words; i++) {
+        set->words[i] = ~set->words[i];
+    }
+    set->words[words - 1] &= _rocs_plan_ordset_tail_mask(set->record_count);
+    set->count = set->record_count - set->count;
+    _rocs_plan_ordset_drop_cache(set);
+    if (set->count == 0) {
+        _rocs_plan_ordset_drop_words(set);
+    }
+    return n00b_result_ok(bool, true);
 }
 
 bool
@@ -1828,10 +2005,8 @@ n00b_plan_ordset_free(n00b_plan_ordset_t *set)
     if (set == nullptr) {
         return;
     }
-    if (set->bits != nullptr) {
-        n00b_free(set->bits);
-    }
-    n00b_free(set);
+    _rocs_plan_ordset_drop_words(set);
+    _rocs_plan_ordset_free_storage(set->allocator, set);
 }
 
 n00b_result_t(bool)
@@ -1848,6 +2023,139 @@ n00b_plan_ordset_contains(n00b_plan_ordset_t *set, uint64_t ordinal)
     return n00b_result_ok(bool, _rocs_plan_ordset_bit_is_set(set, ordinal));
 }
 
+// Word `w` of the set. An empty set has no words and reads as all zero.
+static inline uint64_t
+_rocs_plan_ordset_word(n00b_plan_ordset_t *set, uint64_t w)
+{
+    return set->words == nullptr ? 0 : set->words[w];
+}
+
+uint64_t
+_rocs_plan_ordset_next_set(n00b_plan_ordset_t *set, uint64_t from)
+{
+    if (set == nullptr || set->count == 0 || from >= set->record_count) {
+        return UINT64_MAX;
+    }
+    uint64_t words = (set->record_count + 63) >> 6;
+    uint64_t w     = from >> 6;
+    uint64_t word  = _rocs_plan_ordset_word(set, w)
+                  & (~UINT64_C(0) << (from & 63));
+    for (;;) {
+        if (word != 0) {
+            uint64_t ordinal = (w << 6) + (uint64_t)__builtin_ctzll(word);
+            return ordinal < set->record_count ? ordinal : UINT64_MAX;
+        }
+        if (++w >= words) {
+            return UINT64_MAX;
+        }
+        word = _rocs_plan_ordset_word(set, w);
+    }
+}
+
+uint64_t
+_rocs_plan_ordset_prev_set(n00b_plan_ordset_t *set, uint64_t from)
+{
+    if (set == nullptr || set->count == 0 || set->record_count == 0) {
+        return UINT64_MAX;
+    }
+    if (from >= set->record_count) {
+        from = set->record_count - 1;
+    }
+    uint64_t w     = from >> 6;
+    uint64_t shift = 63 - (from & 63);
+    uint64_t word  = _rocs_plan_ordset_word(set, w) & (~UINT64_C(0) >> shift);
+    for (;;) {
+        if (word != 0) {
+            return (w << 6) + 63 - (uint64_t)__builtin_clzll(word);
+        }
+        if (w == 0) {
+            return UINT64_MAX;
+        }
+        word = _rocs_plan_ordset_word(set, --w);
+    }
+}
+
+uint64_t
+_rocs_plan_ordset_count_range(n00b_plan_ordset_t *set,
+                              uint64_t            first,
+                              uint64_t            end)
+{
+    if (set == nullptr || set->count == 0) {
+        return 0;
+    }
+    if (end > set->record_count) {
+        end = set->record_count;
+    }
+    if (first >= end) {
+        return 0;
+    }
+    if (first == 0 && end == set->record_count) {
+        return set->count;
+    }
+
+    uint64_t first_w = first >> 6;
+    uint64_t last_w  = (end - 1) >> 6;
+    uint64_t total   = 0;
+    for (uint64_t w = first_w; w <= last_w; w++) {
+        uint64_t word = _rocs_plan_ordset_word(set, w);
+        if (w == first_w) {
+            word &= ~UINT64_C(0) << (first & 63);
+        }
+        if (w == last_w) {
+            word &= ~UINT64_C(0) >> (63 - ((end - 1) & 63));
+        }
+        total += (uint64_t)__builtin_popcountll(word);
+    }
+    return total;
+}
+
+n00b_result_t(n00b_option_t(uint64_t))
+n00b_plan_ordset_next(n00b_plan_ordset_t *set, uint64_t from)
+{
+    auto ok = _rocs_plan_ordset_check(set);
+    if (n00b_result_is_err(ok)) {
+        return n00b_result_err(n00b_option_t(uint64_t),
+                               n00b_result_get_err(ok));
+    }
+    uint64_t ordinal = _rocs_plan_ordset_next_set(set, from);
+    if (ordinal == UINT64_MAX) {
+        return n00b_result_ok(n00b_option_t(uint64_t),
+                              n00b_option_none(uint64_t));
+    }
+    return n00b_result_ok(n00b_option_t(uint64_t),
+                          n00b_option_set(uint64_t, ordinal));
+}
+
+n00b_result_t(n00b_option_t(uint64_t))
+n00b_plan_ordset_prev(n00b_plan_ordset_t *set, uint64_t from)
+{
+    auto ok = _rocs_plan_ordset_check(set);
+    if (n00b_result_is_err(ok)) {
+        return n00b_result_err(n00b_option_t(uint64_t),
+                               n00b_result_get_err(ok));
+    }
+    uint64_t ordinal = _rocs_plan_ordset_prev_set(set, from);
+    if (ordinal == UINT64_MAX) {
+        return n00b_result_ok(n00b_option_t(uint64_t),
+                              n00b_option_none(uint64_t));
+    }
+    return n00b_result_ok(n00b_option_t(uint64_t),
+                          n00b_option_set(uint64_t, ordinal));
+}
+
+n00b_result_t(uint64_t)
+n00b_plan_ordset_count_range(n00b_plan_ordset_t *set,
+                             uint64_t            first,
+                             uint64_t            end)
+{
+    auto ok = _rocs_plan_ordset_check(set);
+    if (n00b_result_is_err(ok)) {
+        return n00b_result_err(uint64_t, n00b_result_get_err(ok));
+    }
+    return n00b_result_ok(uint64_t,
+                          _rocs_plan_ordset_count_range(set, first, end));
+}
+
 n00b_result_t(n00b_option_t(uint64_t))
 n00b_plan_ordset_at(n00b_plan_ordset_t *set, uint64_t index)
 {
@@ -1861,35 +2169,28 @@ n00b_plan_ordset_at(n00b_plan_ordset_t *set, uint64_t index)
                               n00b_option_none(uint64_t));
     }
 
-    // Build the ascending-ordinal cache once (single O(record_count) bitmap
-    // walk, byte-at-a-time skipping empty bytes), then serve every at() from it
-    // in O(1). This turns an ordset_at(0..count-1) iteration from O(count *
-    // record_count) into O(record_count + count).
+    // Build the ascending-ordinal cache once (one pass over the words,
+    // skipping empty ones), then serve every at() from it in O(1). This turns
+    // an ordset_at(0..count-1) iteration from O(count * record_count) into
+    // O(record_count / 64 + count).
     if (set->ord_cache == nullptr && set->count != 0) {
         uint64_t *cache = n00b_alloc_array_with_opts(
             uint64_t,
             set->count,
-            &(n00b_alloc_opts_t){.allocator = set->allocator});
+            &(n00b_alloc_opts_t){.allocator = set->allocator,
+                                 .scan_kind = N00B_GC_SCAN_KIND_NONE});
         if (cache == nullptr) {
             return n00b_result_err(n00b_option_t(uint64_t),
                                    N00B_PLAN_ERR_STATE);
         }
-        uint64_t             seen = 0;
-        const uint8_t *const data = (const uint8_t *)set->bits->data;
-        for (uint64_t ordinal = 0; ordinal < set->record_count;) {
-            uint8_t b = data[ordinal >> 3];
-            if (b == 0) {
-                // Skip the rest of an all-zero byte in one step.
-                ordinal = (ordinal & ~UINT64_C(7)) + 8;
-                continue;
+        uint64_t seen  = 0;
+        uint64_t words = (set->record_count + 63) >> 6;
+        for (uint64_t w = 0; w < words && seen < set->count; w++) {
+            uint64_t bits = set->words[w];
+            while (bits != 0 && seen < set->count) {
+                cache[seen++] = (w << 6) + (uint64_t)__builtin_ctzll(bits);
+                bits &= bits - 1;
             }
-            if ((b & (uint8_t)(UINT8_C(1) << (ordinal & UINT64_C(7)))) != 0) {
-                cache[seen++] = ordinal;
-                if (seen == set->count) {
-                    break;
-                }
-            }
-            ordinal++;
         }
         if (seen != set->count) {
             return n00b_result_err(n00b_option_t(uint64_t),
@@ -1961,34 +2262,16 @@ n00b_plan_ordset_complement(n00b_plan_ordset_t *set) _kargs
                                      .allocator = allocator);
     }
 
-    auto out_r = _rocs_plan_ordset_new(set->record_count,
-                                      false,
-                                      .allocator = allocator);
+    auto out_r = _rocs_plan_ordset_clone(set, .allocator = allocator);
     if (n00b_result_is_err(out_r)) {
         return out_r;
     }
-
-    n00b_plan_ordset_t *out = n00b_result_get(out_r);
-    {
-        auto ensure_r = _rocs_plan_ordset_bits_ensure(out);
-        if (n00b_result_is_err(ensure_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   n00b_result_get_err(ensure_r));
-        }
+    auto flip_r = _rocs_plan_ordset_complement_in_place(n00b_result_get(out_r));
+    if (n00b_result_is_err(flip_r)) {
+        return n00b_result_err(n00b_plan_ordset_t *,
+                               n00b_result_get_err(flip_r));
     }
-    uint64_t bytes = (uint64_t)set->bits->byte_len;
-    uint64_t count = 0;
-    for (uint64_t i = 0; i < bytes; i++) {
-        uint8_t v = (uint8_t)~((uint8_t)set->bits->data[i]);
-        if (i + 1 == bytes && (set->record_count & UINT64_C(7)) != 0) {
-            v &= _rocs_plan_ordset_tail_mask(set->record_count);
-        }
-        out->bits->data[i] = (char)v;
-        count += _rocs_plan_ordset_popcount_byte(v);
-    }
-
-    out->count = count;
-    return n00b_result_ok(n00b_plan_ordset_t *, out);
+    return out_r;
 }
 
 n00b_result_t(n00b_plan_predicate_t *)
@@ -3939,13 +4222,29 @@ rocs_plan_has_countable_leaf(n00b_plan_node_t *node)
     return false;
 }
 
+// Settling acts only on INTERSECT and UNION, ordering their children and
+// cutting an intersection with an empty operand. A plan with neither is left
+// exactly as built, whatever the counts say.
+static bool
+rocs_plan_has_group(n00b_plan_node_t *node)
+{
+    if (node == nullptr) {
+        return false;
+    }
+    if (node->kind == N00B_PLAN_NODE_INTERSECT
+        || node->kind == N00B_PLAN_NODE_UNION) {
+        return true;
+    }
+    return rocs_plan_has_group(node->child);
+}
+
 bool
 n00b_plan_wants_counts(n00b_plan_node_t *plan)
 {
     if (plan == nullptr || !n00b_plan_cost_enabled()) {
         return false;
     }
-    return rocs_plan_has_countable_leaf(plan);
+    return rocs_plan_has_group(plan) && rocs_plan_has_countable_leaf(plan);
 }
 
 /**
@@ -4571,9 +4870,9 @@ n00b_plan_shard_may_match(n00b_plan_partition_filter_t *filter,
 #define ROCS_COST_WALK_STEP_MAPPED    7
 #define ROCS_COST_SEARCH_STEP_HOT    20
 #define ROCS_COST_SEARCH_STEP_MAPPED 52
-// Also unmeasured: 80 per 64-bit word is what record_count/8 comes to in these
-// units.
-#define ROCS_COST_BITMAP_WORD        80
+// Also unmeasured. Enumerating a set loads each 64-bit word once and takes a
+// count-trailing-zeros per member, so a word is priced as one hot walk step.
+#define ROCS_COST_BITMAP_WORD        10
 
 static _Atomic(int) rocs_plan_cost_state = -1;
 

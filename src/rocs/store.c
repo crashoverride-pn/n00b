@@ -10045,10 +10045,11 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
                                n00b_plan_predicate_t *predicate,
                                n00b_store_pos_t      *after) _kargs
 {
-    n00b_allocator_t    *allocator  = nullptr;
-    n00b_store_pos_t    *through    = nullptr;
-    n00b_plan_cancel_fn  cancel_cb  = nullptr;
-    void                *cancel_ctx = nullptr;
+    n00b_allocator_t    *allocator    = nullptr;
+    n00b_store_pos_t    *through      = nullptr;
+    n00b_plan_cancel_fn  cancel_cb    = nullptr;
+    void                *cancel_ctx   = nullptr;
+    uint64_t             result_limit = UINT64_MAX;
 }
 {
     if (store == nullptr || predicate == nullptr) {
@@ -10067,6 +10068,11 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     if (store->state != N00B_STORE_STATE_OPEN) {
         return n00b_result_err(n00b_store_hot_tail_scan_t,
                                N00B_STORE_ERR_STATE);
+    }
+
+    // A scan allowed no matches reads nothing, so it observes nothing either.
+    if (result_limit == 0) {
+        return n00b_result_ok(n00b_store_hot_tail_scan_t, scan);
     }
 
     // Pin the hot arena across the whole hot-index scan; every return unpins.
@@ -10162,12 +10168,17 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     }
     (void)n00b_plan_settle(plan, record_limit, .allocator = allocator);
 
+    // Ordinals below first_ordinal were delivered by an earlier scan, so a
+    // tail that wakes once per commit reads each record once over the shard's
+    // life, and the limit counts matches from there.
     auto ordinals_r = n00b_plan_exec_hot(plan,
                                          hot,
-                                         .allocator    = allocator,
-                                         .cancel_cb    = cancel_cb,
-                                         .cancel_ctx   = cancel_ctx,
-                                         .record_limit = record_limit);
+                                         .allocator     = allocator,
+                                         .cancel_cb     = cancel_cb,
+                                         .cancel_ctx    = cancel_ctx,
+                                         .record_limit  = record_limit,
+                                         .first_ordinal = first_ordinal,
+                                         .result_limit  = result_limit);
     if (n00b_result_is_err(ordinals_r)) {
         n00b_pinref_unpin(&store->hot_pin);
         return n00b_result_err(
@@ -10176,24 +10187,12 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
     }
 
     n00b_plan_ordset_t *ordinals = n00b_result_get(ordinals_r);
-    auto count_r = n00b_plan_ordset_count(ordinals);
-    if (n00b_result_is_err(count_r)) {
-        n00b_pinref_unpin(&store->hot_pin);
-        return n00b_result_err(
-            n00b_store_hot_tail_scan_t,
-            rocs_store_err_from_plan(n00b_result_get_err(count_r)));
-    }
-
-    uint64_t ordinal_count = n00b_result_get(count_r);
-    for (uint64_t i = 0; i < ordinal_count; i++) {
-        if (cancel_cb != nullptr && (i & 0x3FF) == 0
-            && cancel_cb(cancel_ctx)) {
-            n00b_pinref_unpin(&store->hot_pin);
-            return n00b_result_err(n00b_store_hot_tail_scan_t,
-                                   N00B_STORE_ERR_CANCELED);
-        }
-        auto ordinal_r = n00b_plan_ordset_at(ordinals, i);
+    uint64_t kept = 0;
+    uint64_t from = first_ordinal;
+    while (kept < result_limit) {
+        auto ordinal_r = n00b_plan_ordset_next(ordinals, from);
         if (n00b_result_is_err(ordinal_r)) {
+            n00b_plan_ordset_free(ordinals);
             n00b_pinref_unpin(&store->hot_pin);
             return n00b_result_err(
                 n00b_store_hot_tail_scan_t,
@@ -10202,14 +10201,19 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
 
         n00b_option_t(uint64_t) ordinal_opt = n00b_result_get(ordinal_r);
         if (!n00b_option_is_set(ordinal_opt)) {
+            break;
+        }
+        uint64_t ordinal = n00b_option_get(ordinal_opt);
+        if (ordinal >= record_limit) {
+            break;
+        }
+        // Polled per match copied, on the first and every 1024 after.
+        if (cancel_cb != nullptr && (kept & 0x3FF) == 0
+            && cancel_cb(cancel_ctx)) {
+            n00b_plan_ordset_free(ordinals);
             n00b_pinref_unpin(&store->hot_pin);
             return n00b_result_err(n00b_store_hot_tail_scan_t,
-                                   N00B_STORE_ERR_INDEX);
-        }
-
-        uint64_t ordinal = n00b_option_get(ordinal_opt);
-        if (ordinal < first_ordinal || ordinal >= record_limit) {
-            continue;
+                                   N00B_STORE_ERR_CANCELED);
         }
 
         n00b_store_pos_t pos = {
@@ -10218,7 +10222,14 @@ n00b_store_hot_tail_scan_after(n00b_store_t          *store,
             .ordinal    = ordinal,
         };
         n00b_list_push(*scan.matches, pos);
+        kept++;
+        from = ordinal + 1;
     }
+    if (kept == result_limit && kept != 0) {
+        last         = n00b_list_get(*scan.matches, (size_t)(kept - 1));
+        record_limit = last.ordinal + 1;
+    }
+    n00b_plan_ordset_free(ordinals);
 
     n00b_pinref_unpin(&store->hot_pin);
     scan.has_last_observed = true;

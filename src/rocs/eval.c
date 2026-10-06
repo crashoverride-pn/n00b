@@ -120,6 +120,13 @@ typedef struct {
     n00b_allocator_t          *allocator;
     n00b_plan_cancel_fn        cancel_cb;
     void                      *cancel_ctx;
+    // Only candidates in [first_ordinal, end_ordinal) are verified. The scan
+    // walks them ascending, or descending when `reverse`, and stops once it
+    // has kept `result_limit` matches.
+    uint64_t                   first_ordinal;
+    uint64_t                   end_ordinal;
+    uint64_t                   result_limit;
+    bool                       reverse;
     // Bounded: a group past the bound orders into the caller's scratch, so
     // the bound costs repeated work and never order.
     _rocs_plan_order_entry_t   order_cache[ROCS_ORDER_CACHE_MAX];
@@ -978,6 +985,21 @@ _rocs_plan_residual_record(_rocs_plan_scan_ctx_t *ctx,
     return n00b_result_ok(n00b_json_node_t *, record);
 }
 
+// Candidate walks for the record scan, where a null set is every ordinal.
+static inline uint64_t
+_rocs_plan_scan_next(n00b_plan_ordset_t *candidates, uint64_t from)
+{
+    return candidates == nullptr ? from
+                                 : _rocs_plan_ordset_next_set(candidates, from);
+}
+
+static inline uint64_t
+_rocs_plan_scan_prev(n00b_plan_ordset_t *candidates, uint64_t from)
+{
+    return candidates == nullptr ? from
+                                 : _rocs_plan_ordset_prev_set(candidates, from);
+}
+
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
                              n00b_plan_ordset_t      *candidates,
@@ -990,14 +1012,17 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
         return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_ARG);
     }
 
-    auto ok = _rocs_plan_ordset_check(candidates);
-    if (n00b_result_is_err(ok)) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               n00b_result_get_err(ok));
-    }
-    if (candidates->record_count != ctx->record_count) {
-        return n00b_result_err(n00b_plan_ordset_t *,
-                               N00B_PLAN_ERR_UNIVERSE);
+    // A null candidate set is every ordinal in the scan's universe.
+    if (candidates != nullptr) {
+        auto ok = _rocs_plan_ordset_check(candidates);
+        if (n00b_result_is_err(ok)) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(ok));
+        }
+        if (candidates->record_count != ctx->record_count) {
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   N00B_PLAN_ERR_UNIVERSE);
+        }
     }
     if (residual == nullptr) {
         return n00b_result_ok(n00b_plan_ordset_t *, candidates);
@@ -1040,8 +1065,18 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
     ctx->allocator                = (n00b_allocator_t *)scratch;
     n00b_err_t verify_err         = N00B_PLAN_OK;
 
-    uint64_t candidate_count = candidates->count;
-    for (uint64_t i = 0; i < candidate_count; i++) {
+    uint64_t first = ctx->first_ordinal;
+    uint64_t end   = ctx->end_ordinal < ctx->record_count ? ctx->end_ordinal
+                                                          : ctx->record_count;
+    uint64_t kept  = 0;
+    uint64_t ordinal = first >= end
+                         ? UINT64_MAX
+                         : ctx->reverse ? _rocs_plan_scan_prev(candidates, end - 1)
+                                        : _rocs_plan_scan_next(candidates, first);
+    for (uint64_t i = 0;
+         ordinal != UINT64_MAX && ordinal >= first && ordinal < end
+         && kept < ctx->result_limit;
+         i++) {
         // Cooperative cancellation: each candidate costs a record view + a
         // full JSON parse, so an unindexed residual over a large shard runs
         // long. Poll every 1024 candidates (the query.c scan-loop idiom) so a
@@ -1052,17 +1087,6 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
             verify_err = N00B_PLAN_ERR_CANCELED;
             break;
         }
-        auto ordinal_r = n00b_plan_ordset_at(candidates, i);
-        if (n00b_result_is_err(ordinal_r)) {
-            verify_err = n00b_result_get_err(ordinal_r);
-            break;
-        }
-        n00b_option_t(uint64_t) ordinal_opt = n00b_result_get(ordinal_r);
-        if (!n00b_option_is_set(ordinal_opt)) {
-            verify_err = N00B_PLAN_ERR_STATE;
-            break;
-        }
-        uint64_t ordinal = n00b_option_get(ordinal_opt);
 
 #ifdef N00B_DEBUG
         atomic_fetch_add_explicit(&rocs_records_scanned,
@@ -1110,20 +1134,44 @@ _rocs_plan_scan_records(_rocs_plan_scan_ctx_t *ctx,
                 verify_err = n00b_result_get_err(insert_r);
                 break;
             }
+            kept++;
         }
 
         // Drop this candidate's record view and values; only `out` survives.
         n00b_arena_reset(scratch);
+
+        if (ctx->reverse) {
+            ordinal = ordinal == 0
+                        ? UINT64_MAX
+                        : _rocs_plan_scan_prev(candidates, ordinal - 1);
+        }
+        else {
+            ordinal = _rocs_plan_scan_next(candidates, ordinal + 1);
+        }
     }
 
     ctx->allocator = saved_alloc;
     n00b_allocator_destroy((n00b_allocator_t *)scratch);
 
     if (verify_err != N00B_PLAN_OK) {
+        n00b_plan_ordset_free(out);
         return n00b_result_err(n00b_plan_ordset_t *, verify_err);
     }
 
     return n00b_result_ok(n00b_plan_ordset_t *, out);
+}
+
+// The executor passes nullptr for "every ordinal"; callers outside it always
+// get a set.
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_materialize(n00b_plan_ordset_t *set,
+                       uint64_t            record_count,
+                       n00b_allocator_t   *allocator)
+{
+    if (set != nullptr) {
+        return n00b_result_ok(n00b_plan_ordset_t *, set);
+    }
+    return n00b_plan_ordset_full(record_count, .allocator = allocator);
 }
 
 n00b_result_t(n00b_plan_ordset_t *)
@@ -1144,18 +1192,17 @@ n00b_plan_record_scan_hot(n00b_store_shard_t    *shard,
     // standing alone wants. This is the one case where the shard's own count is
     // the right universe; when candidates are supplied theirs is authoritative,
     // for the reason below.
+    uint64_t record_count = 0;
     if (candidates == nullptr) {
         auto rc_r = _rocs_plan_hot_record_count(shard);
         if (n00b_result_is_err(rc_r)) {
             return n00b_result_err(n00b_plan_ordset_t *,
                                    n00b_result_get_err(rc_r));
         }
-        auto full_r = n00b_plan_ordset_full(n00b_result_get(rc_r),
-                                            .allocator = allocator);
-        if (n00b_result_is_err(full_r)) {
-            return full_r;
-        }
-        candidates = n00b_result_get(full_r);
+        record_count = n00b_result_get(rc_r);
+    }
+    else {
+        record_count = candidates->record_count;
     }
 
     // The scan universe is the candidate ordset's, which planning froze
@@ -1173,16 +1220,24 @@ n00b_plan_record_scan_hot(n00b_store_shard_t    *shard,
         .source       = _rocs_plan_scan_src_hot,
         .hot_shard    = shard,
         .mapped_shard = nullptr,
-        .record_count = candidates->record_count,
+        .record_count = record_count,
         .allocator    = allocator,
         .cancel_cb    = cancel_cb,
         .cancel_ctx   = cancel_ctx,
+        .end_ordinal  = UINT64_MAX,
+        .result_limit = UINT64_MAX,
     };
 
-    return _rocs_plan_scan_records(&ctx,
-                                   candidates,
-                                        residual,
-                                        .allocator = allocator);
+    auto scan_r = _rocs_plan_scan_records(&ctx,
+                                          candidates,
+                                          residual,
+                                          .allocator = allocator);
+    if (n00b_result_is_err(scan_r)) {
+        return scan_r;
+    }
+    return _rocs_plan_materialize(n00b_result_get(scan_r),
+                                  record_count,
+                                  allocator);
 }
 
 n00b_result_t(n00b_plan_ordset_t *)
@@ -1201,15 +1256,6 @@ n00b_plan_record_scan_mapped(n00b_store_map_shard_t *shard,
                                n00b_result_get_err(record_count_r));
     }
 
-    if (candidates == nullptr) {
-        auto full_r = n00b_plan_ordset_full(n00b_result_get(record_count_r),
-                                            .allocator = allocator);
-        if (n00b_result_is_err(full_r)) {
-            return full_r;
-        }
-        candidates = n00b_result_get(full_r);
-    }
-
     _rocs_plan_scan_ctx_t ctx = {
         .source       = _rocs_plan_scan_src_mapped,
         .hot_shard    = nullptr,
@@ -1218,12 +1264,20 @@ n00b_plan_record_scan_mapped(n00b_store_map_shard_t *shard,
         .allocator    = allocator,
         .cancel_cb    = cancel_cb,
         .cancel_ctx   = cancel_ctx,
+        .end_ordinal  = UINT64_MAX,
+        .result_limit = UINT64_MAX,
     };
 
-    return _rocs_plan_scan_records(&ctx,
-                                   candidates,
-                                        residual,
-                                        .allocator = allocator);
+    auto scan_r = _rocs_plan_scan_records(&ctx,
+                                          candidates,
+                                          residual,
+                                          .allocator = allocator);
+    if (n00b_result_is_err(scan_r)) {
+        return scan_r;
+    }
+    return _rocs_plan_materialize(n00b_result_get(scan_r),
+                                  n00b_result_get(record_count_r),
+                                  allocator);
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,6 +1305,16 @@ typedef struct {
     // Seal-time schema watermark; zero disables the trust. See
     // N00B_STORE_SCHEMA_DECLARED_SINCE_NS and _rocs_plan_declared_absent_empty.
     uint64_t                   schema_declared_since_ns;
+    // Every node runs restricted to ordinals at or above first_ordinal. The
+    // rest is honored only by a record scan whose output is the whole answer,
+    // which is what final_answer marks: it verifies nothing at or past
+    // end_ordinal and keeps the first result_limit matches in ascending
+    // ordinal order, or descending when reverse.
+    uint64_t                   first_ordinal;
+    uint64_t                   end_ordinal;
+    uint64_t                   result_limit;
+    bool                       reverse;
+    bool                       final_answer;
     // Posting counts read on this shard, kept for as long as the shard is
     // being scanned. A group reads one per child to order them and then every
     // child reads its own again on the way down; a count is fixed for a given
@@ -1282,44 +1346,65 @@ _rocs_plan_exec_verify(_rocs_plan_exec_ctx_t *ctx,
                        n00b_plan_ordset_t    *candidates,
                        n00b_plan_predicate_t *predicate)
 {
-    if (ctx->source == _rocs_plan_scan_src_hot) {
-        return n00b_plan_record_scan_hot(ctx->hot_shard,
-                                         candidates,
-                                         predicate,
-                                         .allocator  = ctx->allocator,
-                                         .cancel_cb  = ctx->cancel_cb,
-                                         .cancel_ctx = ctx->cancel_ctx);
+    // The universe is the executor's: for a hot shard that is the count
+    // planning froze, never the live shard's current length (see
+    // n00b_plan_record_scan_hot).
+    _rocs_plan_scan_ctx_t scan = {
+        .source        = ctx->source,
+        .hot_shard     = ctx->hot_shard,
+        .mapped_shard  = ctx->mapped_shard,
+        .record_count  = ctx->record_count,
+        .allocator     = ctx->allocator,
+        .cancel_cb     = ctx->cancel_cb,
+        .cancel_ctx    = ctx->cancel_ctx,
+        .first_ordinal = ctx->final_answer ? ctx->first_ordinal : 0,
+        .end_ordinal   = ctx->final_answer ? ctx->end_ordinal : UINT64_MAX,
+        .result_limit  = ctx->final_answer ? ctx->result_limit : UINT64_MAX,
+        .reverse       = ctx->final_answer && ctx->reverse,
+    };
+    return _rocs_plan_scan_records(&scan,
+                                   candidates,
+                                   predicate,
+                                   .allocator = ctx->allocator);
+}
+
+// Every node answers with either the restriction it was handed (borrowed,
+// nullptr meaning the whole shard) or a set it allocated, which its caller
+// owns. Ownership is read off the pointer, so a consumed intermediate is
+// freed as soon as it is folded.
+static void
+_rocs_plan_release(n00b_plan_ordset_t *set, n00b_plan_ordset_t *borrowed)
+{
+    if (set != nullptr && set != borrowed) {
+        n00b_plan_ordset_free(set);
     }
-    return n00b_plan_record_scan_mapped(ctx->mapped_shard,
-                                        candidates,
-                                        predicate,
-                                        .allocator  = ctx->allocator,
-                                        .cancel_cb  = ctx->cancel_cb,
-                                        .cancel_ctx = ctx->cancel_ctx);
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_exec_universe(_rocs_plan_exec_ctx_t *ctx,
-                         n00b_plan_ordset_t    *restrict_to)
+_rocs_plan_exec_empty(_rocs_plan_exec_ctx_t *ctx)
 {
-    if (restrict_to != nullptr) {
-        return n00b_result_ok(n00b_plan_ordset_t *, restrict_to);
-    }
-    return n00b_plan_ordset_full(ctx->record_count,
-                                 .allocator = ctx->allocator);
+    return n00b_plan_ordset_empty(ctx->record_count,
+                                  .allocator = ctx->allocator);
 }
 
+// `set` is owned by the caller or is `restrict_to` itself; the answer is
+// `set` narrowed in place, or the restriction when `set` was the universe.
 static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_narrow(_rocs_plan_exec_ctx_t *ctx,
-                  n00b_plan_ordset_t    *set,
-                  n00b_plan_ordset_t    *restrict_to)
+_rocs_plan_narrow(n00b_plan_ordset_t *set, n00b_plan_ordset_t *restrict_to)
 {
-    if (restrict_to == nullptr) {
+    if (restrict_to == nullptr || set == restrict_to) {
         return n00b_result_ok(n00b_plan_ordset_t *, set);
     }
-    return n00b_plan_ordset_intersection(set,
-                                         restrict_to,
-                                         .allocator = ctx->allocator);
+    if (set == nullptr) {
+        return n00b_result_ok(n00b_plan_ordset_t *, restrict_to);
+    }
+    auto and_r = _rocs_plan_ordset_and_into(set, restrict_to);
+    if (n00b_result_is_err(and_r)) {
+        n00b_plan_ordset_free(set);
+        return n00b_result_err(n00b_plan_ordset_t *,
+                               n00b_result_get_err(and_r));
+    }
+    return n00b_result_ok(n00b_plan_ordset_t *, set);
 }
 
 static n00b_result_t(n00b_plan_ordset_t *)
@@ -1328,19 +1413,16 @@ _rocs_plan_exec_recover(_rocs_plan_exec_ctx_t *ctx,
                         n00b_plan_ordset_t    *restrict_to)
 {
     if (node->recovery == N00B_PLAN_RECOVER_EMPTY) {
-        return n00b_plan_ordset_empty(ctx->record_count,
-                                      .allocator = ctx->allocator);
+        return _rocs_plan_exec_empty(ctx);
     }
 
-    auto base_r = _rocs_plan_exec_universe(ctx, restrict_to);
-    if (n00b_result_is_err(base_r)
-        || node->recovery != N00B_PLAN_RECOVER_RECORD_SCAN
+    if (node->recovery != N00B_PLAN_RECOVER_RECORD_SCAN
         || node->fallback == nullptr) {
-        return base_r;
+        return n00b_result_ok(n00b_plan_ordset_t *, restrict_to);
     }
     // An exact scan standing alone has nothing downstream to filter it, so the
     // predicate has to be applied here or the query answers with the shard.
-    return _rocs_plan_exec_verify(ctx, n00b_result_get(base_r), node->fallback);
+    return _rocs_plan_exec_verify(ctx, restrict_to, node->fallback);
 }
 
 // Decide whether a declared-indexed field with NO column on this sealed shard
@@ -1497,42 +1579,35 @@ _rocs_plan_exec_index_probe(_rocs_plan_exec_ctx_t    *ctx,
                               memory_order_relaxed);
 #endif
 
-    for (uint64_t i = 0; i < candidates; i++) {
+    n00b_err_t err     = N00B_PLAN_OK;
+    uint64_t   ordinal = _rocs_plan_ordset_next_set(restrict_to, 0);
+    for (uint64_t i = 0; i < candidates && ordinal != UINT64_MAX; i++) {
         // Same stride the other unbounded loops poll on.
         if (ctx->cancel_cb != nullptr && (i & 0x3FF) == 0
             && ctx->cancel_cb(ctx->cancel_ctx)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   N00B_PLAN_ERR_CANCELED);
+            err = N00B_PLAN_ERR_CANCELED;
+            break;
         }
-
-        auto at_r = n00b_plan_ordset_at(restrict_to, i);
-        if (n00b_result_is_err(at_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   n00b_result_get_err(at_r));
-        }
-        n00b_option_t(uint64_t) opt = n00b_result_get(at_r);
-        if (!n00b_option_is_set(opt)) {
-            return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
-        }
-        uint64_t ordinal = n00b_option_get(opt);
 
         auto has_r = n00b_store_index_probe_contains(probe, ordinal);
         if (n00b_result_is_err(has_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   _rocs_plan_index_err(
-                                       n00b_result_get_err(has_r)));
+            err = _rocs_plan_index_err(n00b_result_get_err(has_r));
+            break;
         }
-        if (!n00b_result_get(has_r)) {
-            continue;
+        if (n00b_result_get(has_r)) {
+            auto insert_r = n00b_plan_ordset_insert(out, ordinal);
+            if (n00b_result_is_err(insert_r)) {
+                err = n00b_result_get_err(insert_r);
+                break;
+            }
         }
-
-        auto insert_r = n00b_plan_ordset_insert(out, ordinal);
-        if (n00b_result_is_err(insert_r)) {
-            return n00b_result_err(n00b_plan_ordset_t *,
-                                   n00b_result_get_err(insert_r));
-        }
+        ordinal = _rocs_plan_ordset_next_set(restrict_to, ordinal + 1);
     }
 
+    if (err != N00B_PLAN_OK) {
+        n00b_plan_ordset_free(out);
+        return n00b_result_err(n00b_plan_ordset_t *, err);
+    }
     return n00b_result_ok(n00b_plan_ordset_t *, out);
 }
 
@@ -1566,7 +1641,7 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
             if (n00b_plan_cost_term_covers_shard(node->lossy,
                                                  df,
                                                  ctx->record_count)) {
-                return _rocs_plan_exec_universe(ctx, restrict_to);
+                return n00b_result_ok(n00b_plan_ordset_t *, restrict_to);
             }
 
             // Every way out of the block below falls through to the walk,
@@ -1632,8 +1707,7 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
             // No column for a field the plan has an index descriptor for. Either
             // nothing here populated it, or this shard predates its declaration.
             if (_rocs_plan_declared_absent_empty(ctx)) {
-                return n00b_plan_ordset_empty(ctx->record_count,
-                                              .allocator = ctx->allocator);
+                return _rocs_plan_exec_empty(ctx);
             }
             return _rocs_plan_exec_recover(ctx, node, restrict_to);
         }
@@ -1673,32 +1747,10 @@ _rocs_plan_exec_index_scan(_rocs_plan_exec_ctx_t *ctx,
     // This needs the set in hand, which is why the planner cannot decide it.
     if (node->lossy
         && _rocs_plan_candidate_set_is_broad(n00b_result_get(set_r))) {
-        return _rocs_plan_exec_universe(ctx, restrict_to);
+        n00b_plan_ordset_free(n00b_result_get(set_r));
+        return n00b_result_ok(n00b_plan_ordset_t *, restrict_to);
     }
-    return _rocs_plan_narrow(ctx, n00b_result_get(set_r), restrict_to);
-}
-
-static n00b_result_t(uint64_t)
-_rocs_plan_count(n00b_plan_ordset_t *set)
-{
-    return n00b_plan_ordset_count(set);
-}
-
-// Run one INTERSECT child and fold it into the accumulator. The accumulator is
-// handed down as the child's restriction, so the child reads only what its
-// siblings already selected.
-static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_intersect_fold(_rocs_plan_exec_ctx_t *ctx,
-                          n00b_plan_node_t      *child,
-                          n00b_plan_ordset_t    *acc)
-{
-    auto child_r = _rocs_plan_exec_node(ctx, child, acc);
-    if (n00b_result_is_err(child_r)) {
-        return child_r;
-    }
-    return n00b_plan_ordset_intersection(acc,
-                                         n00b_result_get(child_r),
-                                         .allocator = ctx->allocator);
+    return _rocs_plan_narrow(n00b_result_get(set_r), restrict_to);
 }
 
 static bool
@@ -1708,18 +1760,17 @@ _rocs_plan_child_reads_no_records(n00b_plan_node_t *child)
     return n00b_result_is_ok(exact_r) && n00b_result_get(exact_r);
 }
 
+// Each child runs restricted to what its siblings have kept so far, and by the
+// execution contract answers with a subset of that. So the child's answer is
+// the new accumulator as it stands, with no intersection to compute, and the
+// accumulator it replaces is freed.
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx,
                           n00b_plan_node_t      *node,
                           n00b_plan_ordset_t    *restrict_to)
 {
-    size_t count = n00b_list_len(*node->children);
-
-    auto acc_r = _rocs_plan_exec_universe(ctx, restrict_to);
-    if (n00b_result_is_err(acc_r)) {
-        return acc_r;
-    }
-    n00b_plan_ordset_t *acc = n00b_result_get(acc_r);
+    size_t              count = n00b_list_len(*node->children);
+    n00b_plan_ordset_t *acc   = restrict_to;
 
     // Plan order. Which operand runs first is the planner's decision, taken
     // from what each matches on this shard (plan.h rule 4); re-deciding it here
@@ -1728,6 +1779,20 @@ _rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx,
     // The two passes remain: children that read no records go first, so the
     // ones that do inherit everything the indexes ruled out. That is a
     // property of the node kinds, not of the counts, so it belongs here.
+    //
+    // The child that runs last is restricted to everything the others kept,
+    // so its answer is this node's answer, and it inherits final_answer.
+    bool   final_answer = ctx->final_answer;
+    size_t last_child   = SIZE_MAX;
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < count; i++) {
+            n00b_plan_node_t *child = n00b_list_get(*node->children, i);
+            if ((pass == 0) == _rocs_plan_child_reads_no_records(child)) {
+                last_child = i;
+            }
+        }
+    }
+
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < count; i++) {
             n00b_plan_node_t *child = n00b_list_get(*node->children, i);
@@ -1736,14 +1801,20 @@ _rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx,
                 continue;
             }
 
-            auto fold_r = _rocs_plan_intersect_fold(ctx, child, acc);
-            if (n00b_result_is_err(fold_r)) {
-                return fold_r;
+            ctx->final_answer = final_answer && i == last_child;
+            auto child_r      = _rocs_plan_exec_node(ctx, child, acc);
+            ctx->final_answer = final_answer;
+            if (n00b_result_is_err(child_r)) {
+                _rocs_plan_release(acc, restrict_to);
+                return child_r;
             }
-            acc = n00b_result_get(fold_r);
+            n00b_plan_ordset_t *next = n00b_result_get(child_r);
+            if (next != acc) {
+                _rocs_plan_release(acc, restrict_to);
+            }
+            acc = next;
 
-            auto empty_r = _rocs_plan_count(acc);
-            if (n00b_result_is_ok(empty_r) && n00b_result_get(empty_r) == 0) {
+            if (acc != nullptr && acc->count == 0) {
                 return n00b_result_ok(n00b_plan_ordset_t *, acc);
             }
         }
@@ -1751,24 +1822,9 @@ _rocs_plan_exec_intersect(_rocs_plan_exec_ctx_t *ctx,
     return n00b_result_ok(n00b_plan_ordset_t *, acc);
 }
 
-// Run one UNION branch and fold it in. Every branch gets the same restriction:
-// what one branch found does not narrow what another may find, which is the
-// difference from the intersect fold above.
-static n00b_result_t(n00b_plan_ordset_t *)
-_rocs_plan_union_fold(_rocs_plan_exec_ctx_t *ctx,
-                      n00b_plan_node_t      *child,
-                      n00b_plan_ordset_t    *acc,
-                      n00b_plan_ordset_t    *restrict_to)
-{
-    auto child_r = _rocs_plan_exec_node(ctx, child, restrict_to);
-    if (n00b_result_is_err(child_r) || acc == nullptr) {
-        return child_r;
-    }
-    return n00b_plan_ordset_union(acc,
-                                  n00b_result_get(child_r),
-                                  .allocator = ctx->allocator);
-}
-
+// Every branch gets the same restriction: what one branch found does not
+// narrow what another may find, which is the difference from the intersect
+// above. Branches are ORed into the first owned answer in place.
 static n00b_result_t(n00b_plan_ordset_t *)
 _rocs_plan_exec_union(_rocs_plan_exec_ctx_t *ctx,
                       n00b_plan_node_t      *node,
@@ -1782,25 +1838,45 @@ _rocs_plan_exec_union(_rocs_plan_exec_ctx_t *ctx,
     // stops once it covers everything still in play, so the branch covering
     // most gets it there soonest and the rest are skipped outright. That
     // decision is taken at build from what each branch matches on this shard.
+    bool final_answer = ctx->final_answer;
     for (size_t i = 0; i < count; i++) {
-        auto fold_r = _rocs_plan_union_fold(ctx,
+        ctx->final_answer = false;
+        auto child_r = _rocs_plan_exec_node(ctx,
                                             n00b_list_get(*node->children, i),
-                                            acc,
                                             restrict_to);
-        if (n00b_result_is_err(fold_r)) {
-            return fold_r;
+        ctx->final_answer = final_answer;
+        if (n00b_result_is_err(child_r)) {
+            _rocs_plan_release(acc, restrict_to);
+            return child_r;
         }
-        acc = n00b_result_get(fold_r);
+        n00b_plan_ordset_t *child = n00b_result_get(child_r);
 
-        auto full_r = _rocs_plan_count(acc);
-        if (n00b_result_is_ok(full_r) && n00b_result_get(full_r) >= ceiling) {
+        // A branch that kept the whole restriction covers everything in play.
+        if (child == restrict_to) {
+            _rocs_plan_release(acc, restrict_to);
+            return child_r;
+        }
+
+        if (acc == nullptr) {
+            acc = child;
+        }
+        else {
+            auto or_r = _rocs_plan_ordset_or_into(acc, child);
+            n00b_plan_ordset_free(child);
+            if (n00b_result_is_err(or_r)) {
+                n00b_plan_ordset_free(acc);
+                return n00b_result_err(n00b_plan_ordset_t *,
+                                       n00b_result_get_err(or_r));
+            }
+        }
+
+        if (acc->count >= ceiling) {
             return n00b_result_ok(n00b_plan_ordset_t *, acc);
         }
     }
 
     if (acc == nullptr) {
-        return n00b_plan_ordset_empty(ctx->record_count,
-                                      .allocator = ctx->allocator);
+        return _rocs_plan_exec_empty(ctx);
     }
     return n00b_result_ok(n00b_plan_ordset_t *, acc);
 }
@@ -1816,19 +1892,11 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx,
 
     switch (node->kind) {
     case N00B_PLAN_NODE_EMPTY:
-        return n00b_plan_ordset_empty(ctx->record_count,
-                                      .allocator = ctx->allocator);
+        return _rocs_plan_exec_empty(ctx);
     case N00B_PLAN_NODE_INDEX_SCAN:
         return _rocs_plan_exec_index_scan(ctx, node, restrict_to);
-    case N00B_PLAN_NODE_RECORD_SCAN: {
-        auto base_r = _rocs_plan_exec_universe(ctx, restrict_to);
-        if (n00b_result_is_err(base_r)) {
-            return base_r;
-        }
-        return _rocs_plan_exec_verify(ctx,
-                                      n00b_result_get(base_r),
-                                      node->predicate);
-    }
+    case N00B_PLAN_NODE_RECORD_SCAN:
+        return _rocs_plan_exec_verify(ctx, restrict_to, node->predicate);
     case N00B_PLAN_NODE_INTERSECT:
         return _rocs_plan_exec_intersect(ctx, node, restrict_to);
     case N00B_PLAN_NODE_UNION:
@@ -1838,29 +1906,83 @@ _rocs_plan_exec_node(_rocs_plan_exec_ctx_t *ctx,
         // narrowed again afterwards, and ~(x & R) & R is ~x & R. Without it a
         // negated record scan would read the whole shard while a selective
         // sibling sat unapplied.
+        bool final_answer = ctx->final_answer;
+        ctx->final_answer = false;
         auto child_r = _rocs_plan_exec_node(ctx, node->child, restrict_to);
+        ctx->final_answer = final_answer;
         if (n00b_result_is_err(child_r)) {
             return child_r;
         }
-        auto comp_r = n00b_plan_ordset_complement(n00b_result_get(child_r),
-                                                  .allocator = ctx->allocator);
-        if (n00b_result_is_err(comp_r)) {
-            return comp_r;
+        n00b_plan_ordset_t *child = n00b_result_get(child_r);
+        // The child kept all of R, so nothing in R is left for its complement.
+        if (child == restrict_to) {
+            return _rocs_plan_exec_empty(ctx);
         }
-        return _rocs_plan_narrow(ctx, n00b_result_get(comp_r), restrict_to);
+        auto flip_r = _rocs_plan_ordset_complement_in_place(child);
+        if (n00b_result_is_err(flip_r)) {
+            n00b_plan_ordset_free(child);
+            return n00b_result_err(n00b_plan_ordset_t *,
+                                   n00b_result_get_err(flip_r));
+        }
+        return _rocs_plan_narrow(child, restrict_to);
     }
     }
     return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
+}
+
+// Top-level execution: `restrict_to` is the caller's floor (or nullptr), and
+// the answer handed back is always a set the caller owns.
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_exec_root(_rocs_plan_exec_ctx_t *ctx,
+                     n00b_plan_node_t      *plan,
+                     n00b_plan_ordset_t    *restrict_to)
+{
+    auto set_r = _rocs_plan_exec_node(ctx, plan, restrict_to);
+    if (n00b_result_is_err(set_r)) {
+        _rocs_plan_release(restrict_to, nullptr);
+        return set_r;
+    }
+    n00b_plan_ordset_t *set = n00b_result_get(set_r);
+    if (set != restrict_to) {
+        _rocs_plan_release(restrict_to, nullptr);
+    }
+    return _rocs_plan_materialize(set, ctx->record_count, ctx->allocator);
+}
+
+// Ordinals below the floor were answered by an earlier call. Handing the rest
+// down as the restriction keeps every record scan and index probe to them.
+static n00b_result_t(n00b_plan_ordset_t *)
+_rocs_plan_exec_from(_rocs_plan_exec_ctx_t *ctx,
+                     n00b_plan_node_t      *plan,
+                     uint64_t               first_ordinal)
+{
+    if (first_ordinal >= ctx->record_count) {
+        return _rocs_plan_exec_empty(ctx);
+    }
+    n00b_plan_ordset_t *floor = nullptr;
+    if (first_ordinal != 0) {
+        auto floor_r = _rocs_plan_ordset_range(ctx->record_count,
+                                               first_ordinal,
+                                               .allocator = ctx->allocator);
+        if (n00b_result_is_err(floor_r)) {
+            return floor_r;
+        }
+        floor = n00b_result_get(floor_r);
+    }
+    return _rocs_plan_exec_root(ctx, plan, floor);
 }
 
 n00b_result_t(n00b_plan_ordset_t *)
 n00b_plan_exec_hot(n00b_plan_node_t   *plan,
                    n00b_store_shard_t *shard) _kargs
 {
-    n00b_allocator_t    *allocator    = nullptr;
-    n00b_plan_cancel_fn  cancel_cb    = nullptr;
-    void                *cancel_ctx   = nullptr;
-    uint64_t             record_limit = UINT64_MAX;
+    n00b_allocator_t    *allocator     = nullptr;
+    n00b_plan_cancel_fn  cancel_cb     = nullptr;
+    void                *cancel_ctx    = nullptr;
+    uint64_t             record_limit  = UINT64_MAX;
+    uint64_t             first_ordinal = 0;
+    uint64_t             result_limit  = UINT64_MAX;
+    bool                 reverse       = false;
 }
 {
     if (plan == nullptr || shard == nullptr) {
@@ -1882,14 +2004,19 @@ n00b_plan_exec_hot(n00b_plan_node_t   *plan,
         return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
     }
     _rocs_plan_exec_ctx_t ctx = {
-        .source       = _rocs_plan_scan_src_hot,
-        .hot_shard    = shard,
-        .record_count = record_count,
-        .allocator    = allocator,
-        .cancel_cb    = cancel_cb,
-        .cancel_ctx   = cancel_ctx,
+        .source        = _rocs_plan_scan_src_hot,
+        .hot_shard     = shard,
+        .record_count  = record_count,
+        .allocator     = allocator,
+        .cancel_cb     = cancel_cb,
+        .cancel_ctx    = cancel_ctx,
+        .first_ordinal = first_ordinal,
+        .end_ordinal   = UINT64_MAX,
+        .result_limit  = result_limit,
+        .reverse       = reverse,
+        .final_answer  = true,
     };
-    return _rocs_plan_exec_node(&ctx, plan, nullptr);
+    return _rocs_plan_exec_from(&ctx, plan, first_ordinal);
 }
 
 n00b_result_t(n00b_plan_ordset_t *)
@@ -1903,6 +2030,10 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
     // store's watermark. A caller that forgets gets today's scan, not a
     // silent false negative.
     uint64_t             schema_declared_since_ns = 0;
+    uint64_t             first_ordinal            = 0;
+    uint64_t             end_ordinal              = UINT64_MAX;
+    uint64_t             result_limit             = UINT64_MAX;
+    bool                 reverse                  = false;
 }
 {
     if (plan == nullptr || shard == nullptr) {
@@ -1921,8 +2052,13 @@ n00b_plan_exec_mapped(n00b_plan_node_t       *plan,
         .cancel_cb    = cancel_cb,
         .cancel_ctx   = cancel_ctx,
         .schema_declared_since_ns = schema_declared_since_ns,
+        .first_ordinal            = first_ordinal,
+        .end_ordinal              = end_ordinal,
+        .result_limit             = result_limit,
+        .reverse                  = reverse,
+        .final_answer             = true,
     };
-    return _rocs_plan_exec_node(&ctx, plan, nullptr);
+    return _rocs_plan_exec_from(&ctx, plan, first_ordinal);
 }
 
 // ---------------------------------------------------------------------------
@@ -2200,6 +2336,34 @@ _rocs_plan_entry_may_match(n00b_store_catalog_entry_t *entry, n00b_plan_node_t *
     }
 }
 
+#ifdef N00B_DEBUG
+static _Atomic(uint64_t) rocs_sealed_entries_planned = 0;
+static _Atomic(uint64_t) rocs_sealed_shards_mapped   = 0;
+
+uint64_t
+n00b_plan_sealed_entries_planned(void)
+{
+    return atomic_load_explicit(&rocs_sealed_entries_planned,
+                                memory_order_relaxed);
+}
+
+uint64_t
+n00b_plan_sealed_shards_mapped(void)
+{
+    return atomic_load_explicit(&rocs_sealed_shards_mapped,
+                                memory_order_relaxed);
+}
+
+void
+n00b_plan_sealed_counts_reset(void)
+{
+    atomic_store_explicit(&rocs_sealed_entries_planned,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&rocs_sealed_shards_mapped, 0, memory_order_relaxed);
+}
+#endif
+
 // The result a shard gets when the catalog proves @p plan matches nothing in
 // it, or Ok(nullptr) when the shard has to be mapped to find out.
 static n00b_result_t(n00b_plan_shard_result_t *)
@@ -2235,6 +2399,10 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
     n00b_allocator_t    *allocator  = nullptr;
     n00b_plan_cancel_fn  cancel_cb  = nullptr;
     void                *cancel_ctx = nullptr;
+    uint64_t             first_ordinal = 0;
+    uint64_t             end_ordinal   = UINT64_MAX;
+    uint64_t             result_limit  = UINT64_MAX;
+    bool                 reverse       = false;
 }
 {
     if (store == nullptr || entry == nullptr || predicate == nullptr) {
@@ -2246,6 +2414,14 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
     n00b_store_resident_shard_t *resident = nullptr;
     n00b_plan_shard_result_t    *result   = nullptr;
     n00b_err_t                   err      = N00B_PLAN_OK;
+
+#ifdef N00B_DEBUG
+    if (!collect_only) {
+        atomic_fetch_add_explicit(&rocs_sealed_entries_planned,
+                                  1,
+                                  memory_order_relaxed);
+    }
+#endif
 
     // The query cursor plans per shard and hands in no settled plan. Build it
     // before reaching the shard, since building reads none (plan.h rule 1),
@@ -2284,6 +2460,12 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
             return skip_r;
         }
     }
+
+#ifdef N00B_DEBUG
+    atomic_fetch_add_explicit(&rocs_sealed_shards_mapped,
+                              1,
+                              memory_order_relaxed);
+#endif
 
     auto resident_r = n00b_store_resident_shard_acquire(
         store,
@@ -2364,26 +2546,30 @@ n00b_plan_catalog_entry_sealed(n00b_store_t               *store,
 
     // One shard's counts, folded in and settled. This is the plan-per-shard
     // path; a fan-out over a partition folds every shard in before settling
-    // once, which is what lets one plan serve them all.
-    auto collect_r = n00b_plan_collect_mapped(plan,
-                                              root,
-                                              .allocator  = allocator,
-                                              .cancel_cb  = cancel_cb,
-                                              .cancel_ctx = cancel_ctx);
-    if (n00b_result_is_err(collect_r)) {
-        if (rocs_plan_debug_enabled()) {
-            fprintf(stderr,
-                    "rocs plan: collect failed plan_err=%lld\n",
-                    (long long)n00b_result_get_err(collect_r));
+    // once, which is what lets one plan serve them all. A plan with nothing
+    // for counts to decide skips both, and execution reads what it needs.
+    if (n00b_plan_wants_counts(plan)) {
+        auto collect_r = n00b_plan_collect_mapped(plan,
+                                                  root,
+                                                  .allocator  = allocator,
+                                                  .cancel_cb  = cancel_cb,
+                                                  .cancel_ctx = cancel_ctx);
+        if (n00b_result_is_err(collect_r)) {
+            if (rocs_plan_debug_enabled()) {
+                fprintf(stderr,
+                        "rocs plan: collect failed plan_err=%lld\n",
+                        (long long)n00b_result_get_err(collect_r));
+            }
+            err = n00b_result_get_err(collect_r);
+            goto release;
         }
-        err = n00b_result_get_err(collect_r);
-        goto release;
-    }
 
-    auto rc_r = _rocs_plan_mapped_record_count(root);
-    (void)n00b_plan_settle(plan,
-                           n00b_result_is_ok(rc_r) ? n00b_result_get(rc_r) : 0,
-                           .allocator = allocator);
+        auto rc_r = _rocs_plan_mapped_record_count(root);
+        (void)n00b_plan_settle(plan,
+                               n00b_result_is_ok(rc_r) ? n00b_result_get(rc_r)
+                                                       : 0,
+                               .allocator = allocator);
+    }
 
 execute:
     // The watermark is a property of the store, read here rather than baked
@@ -2398,7 +2584,11 @@ execute:
                               .schema_declared_since_ns =
                                   n00b_result_is_ok(watermark_r)
                                       ? n00b_result_get(watermark_r)
-                                      : 0);
+                                      : 0,
+                              .first_ordinal     = first_ordinal,
+                              .end_ordinal       = end_ordinal,
+                              .result_limit      = result_limit,
+                              .reverse           = reverse);
     if (n00b_result_is_err(ordinals_r)) {
         if (rocs_plan_debug_enabled()) {
             fprintf(stderr,
@@ -2550,12 +2740,28 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                    .allocator = allocator,
                                    .scan_kind = N00B_GC_SCAN_KIND_ALL);
 
-    n00b_list_t(n00b_string_t *) *keys = n00b_alloc_with_opts(
-        n00b_list_t(n00b_string_t *),
+    // Each partition's index into `plans`, found by key. A store partitioned
+    // by day has a partition per day, so a list scan here costs partitions
+    // per shard.
+    n00b_dict_t(n00b_string_t *, uint64_t) *part_of = n00b_alloc_with_opts(
+        n00b_dict_t(n00b_string_t *, uint64_t),
         &(n00b_alloc_opts_t){.allocator = allocator});
-    *keys = n00b_list_new_private(n00b_string_t *,
-                                  .allocator = allocator,
-                                  .scan_kind = N00B_GC_SCAN_KIND_ALL);
+    n00b_dict_init(part_of,
+                   .hash            = n00b_string_hash,
+                   .skip_obj_hash   = true,
+                   .allocator       = allocator,
+                   .locked          = false,
+                   .key_scan_kind   = N00B_GC_SCAN_KIND_ALL,
+                   .value_scan_kind = N00B_GC_SCAN_KIND_NONE);
+
+    // Per kept entry, its partition's index into `plans`, so the execute pass
+    // looks nothing up.
+    n00b_list_t(uint64_t) *kept_parts = n00b_alloc_with_opts(
+        n00b_list_t(uint64_t),
+        &(n00b_alloc_opts_t){.allocator = allocator});
+    *kept_parts = n00b_list_new_private(uint64_t,
+                                        .allocator = allocator,
+                                        .scan_kind = N00B_GC_SCAN_KIND_NONE);
 
     // Per kept entry, the empty result a shard gets when its catalog entry
     // rules the plan out, else nullptr. Decided once from the unsettled plan,
@@ -2575,7 +2781,7 @@ n00b_plan_store_sealed(n00b_store_t           *store,
     // every union estimates as the narrowest thing there is and sorts to the
     // front of an intersection, which is the ordering exactly inverted.
     //
-    // Grows with the partitions found, in step with `keys` and `plans`. A
+    // Grows with the partitions found, in step with `plans`. A
     // fixed bound here would settle the partitions past it from zero, which
     // is that inverted ordering, silently and only on the large stores where
     // it costs the most: a store partitioned by day passes any fixed bound
@@ -2595,19 +2801,14 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                    N00B_PLAN_ERR_CANCELED);
         }
 
-        n00b_string_t    *key  = n00b_list_get(*kept_keys, i);
-        n00b_plan_node_t *plan = nullptr;
-
-        size_t seen    = n00b_list_len(*keys);
-        size_t part_at = seen;
-        for (size_t j = 0; j < seen; j++) {
-            if (n00b_unicode_str_eq(n00b_list_get(*keys, j), key)) {
-                plan    = n00b_list_get(*plans, j);
-                part_at = j;
-                break;
-            }
+        n00b_string_t    *key     = n00b_list_get(*kept_keys, i);
+        n00b_plan_node_t *plan    = nullptr;
+        bool              found   = false;
+        uint64_t          part_at = n00b_dict_get(part_of, key, &found);
+        if (found) {
+            plan = n00b_list_get(*plans, (size_t)part_at);
         }
-        if (plan == nullptr) {
+        else {
             // Already rewritten above, once, for the filter and every
             // partition to share. Rewriting again is idempotent and would
             // still walk the whole tree through the pairwise dedupe and
@@ -2621,11 +2822,12 @@ n00b_plan_store_sealed(n00b_store_t           *store,
                                        n00b_result_get_err(plan_r));
             }
             plan    = n00b_result_get(plan_r);
-            part_at = n00b_list_len(*keys);
-            n00b_list_push(*keys, key);
+            part_at = (uint64_t)n00b_list_len(*plans);
+            n00b_dict_put(part_of, key, part_at);
             n00b_list_push(*plans, plan);
             n00b_list_push(*part_records, UINT64_C(0));
         }
+        n00b_list_push(*kept_parts, part_at);
 
         auto skip_r = _rocs_plan_entry_skip(n00b_list_get(*kept, i),
                                             plan,
@@ -2642,13 +2844,13 @@ n00b_plan_store_sealed(n00b_store_t           *store,
         auto rc_r = n00b_store_catalog_entry_get_record_count(
             n00b_list_get(*kept, i));
         if (n00b_result_is_ok(rc_r)) {
-            uint64_t total = n00b_list_get(*part_records, part_at);
+            uint64_t total = n00b_list_get(*part_records, (size_t)part_at);
             uint64_t add   = n00b_result_get(rc_r);
             // Saturating. A partition whose shards sum past the range is a
             // corrupt catalog, and wrapping would hand settling a tiny
             // universe rather than a huge one.
             n00b_list_set(*part_records,
-                          part_at,
+                          (size_t)part_at,
                           total > UINT64_MAX - add ? UINT64_MAX : total + add);
         }
 
@@ -2701,15 +2903,8 @@ n00b_plan_store_sealed(n00b_store_t           *store,
             continue;
         }
 
-        n00b_string_t    *key  = n00b_list_get(*kept_keys, i);
-        n00b_plan_node_t *plan = nullptr;
-        size_t            seen = n00b_list_len(*keys);
-        for (size_t j = 0; j < seen; j++) {
-            if (n00b_unicode_str_eq(n00b_list_get(*keys, j), key)) {
-                plan = n00b_list_get(*plans, j);
-                break;
-            }
-        }
+        n00b_plan_node_t *plan =
+            n00b_list_get(*plans, (size_t)n00b_list_get(*kept_parts, i));
 
         auto result_r = n00b_plan_catalog_entry_sealed(store,
                                                        n00b_list_get(*kept, i),
