@@ -11,6 +11,7 @@
 #include "core/pool.h"
 #include "core/runtime.h"
 #include "internal/rocs/index.h"
+#include "internal/rocs/json_field.h"
 #include "net/http/http_service.h"
 #include "parsers/json.h"
 #include "rocs/filter.h"
@@ -1485,6 +1486,26 @@ rocs_service_query_resume(n00b_json_node_t *root)
     return n00b_result_ok(rocs_service_resume_t, out);
 }
 
+// Stored bytes reach the client unparsed, so damaged ones must fail the
+// request rather than corrupt a 200 body. The scan settles nearly every
+// record, and a parse settles the shapes it declines.
+static bool
+rocs_service_record_well_formed(n00b_string_t    *json,
+                                n00b_allocator_t *allocator)
+{
+    if (rocs_json_scan_well_formed(json->data, json->u8_bytes)) {
+        return true;
+    }
+
+    const char *err = nullptr;
+    return n00b_json_parse(json->data,
+                           json->u8_bytes,
+                           &err,
+                           .allocator = allocator)
+            != nullptr
+        && err == nullptr;
+}
+
 static bool
 rocs_service_append_query_hit(n00b_buffer_t      *buf,
                               n00b_query_hit_t   *hit,
@@ -1515,7 +1536,9 @@ rocs_service_append_query_hit(n00b_buffer_t      *buf,
         // Sealed records come back as their stored compact JSON bytes, with
         // no parse, node graph, or re-encode.
         auto json_r = n00b_query_hit_json_string(hit, .allocator = allocator);
-        if (n00b_result_is_err(json_r)) {
+        if (n00b_result_is_err(json_r)
+            || !rocs_service_record_well_formed(n00b_result_get(json_r),
+                                                allocator)) {
             return false;
         }
         rocs_service_append(buf, r",\"record\":");

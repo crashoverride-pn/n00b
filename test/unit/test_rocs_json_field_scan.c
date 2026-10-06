@@ -304,6 +304,115 @@ test_nesting_past_the_parser_stops_both(void)
     n00b_printf("  [PASS] a record too deep to parse is too deep to scan");
 }
 
+static bool
+well_formed(const char *json)
+{
+    return rocs_json_scan_well_formed(json, strlen(json));
+}
+
+// The parser rejects a raw control byte inside a string, so a record holding
+// one has no field to answer for, wherever the byte sits.
+static void
+test_control_bytes_in_a_string_are_declined(void)
+{
+    declines("{\"a\":1,\"b\":\"x\x01y\"}", "a");
+    declines("{\"a\":\"x\ny\"}", "a");
+    declines("{\"b\":\"\x1f\",\"a\":1}", "a");
+
+    // Escaped, the same characters are ordinary string content.
+    agrees("{\"a\":1,\"b\":\"x\\u0001y\\n\"}", "a");
+
+    n00b_printf("  [PASS] a control byte inside a string is declined");
+}
+
+// The parser refuses a number of 64 bytes or more and one out of a double's
+// range, though both are JSON grammar.
+static void
+test_numbers_the_parser_refuses_are_declined(void)
+{
+    static const char *refused[] = {
+        "{\"a\":1,\"b\":1e400}",
+        "{\"a\":1,\"b\":-49.5e21502}",
+        "{\"a\":1,\"b\":1234567890123456789012345678901234567890123456789012345678901234}",
+    };
+    for (size_t k = 0; k < sizeof(refused) / sizeof(refused[0]); k++) {
+        CHECK(!parses(refused[k]));
+        declines(refused[k], "a");
+        CHECK(!well_formed(refused[k]));
+    }
+
+    // Just inside both limits, the scan still answers.
+    agrees("{\"a\":1,\"b\":-9.5e99}", "a");
+    agrees("{\"a\":1,\"b\":123456789012345678901234567890123456789012345678901234567890123}",
+           "a");
+
+    n00b_printf("  [PASS] a number too long or too large to parse is declined");
+}
+
+// The service serves stored record bytes when this says they are well formed,
+// so it may only say so of bytes a parse accepts.
+static void
+test_well_formed_is_what_parses(void)
+{
+    static const char *clean[] = {
+        "{}",
+        "{\"id\":1,\"message\":\"alpha\"}",
+        " {\"a\":[1,{\"b\":null}],\"c\":false} \n",
+        "{\"s\":\"{},[]:\\\"\\u00e9\"}",
+        "[1,-2.5e3]",
+        "\"bare\"",
+    };
+    for (size_t k = 0; k < sizeof(clean) / sizeof(clean[0]); k++) {
+        CHECK(parses(clean[k]));
+        CHECK(well_formed(clean[k]));
+    }
+
+    static const char *damaged[] = {
+        // The damage the service runtime test writes into a sealed shard.
+        "{\"id\"#1,\"message\":\"alpha\"}",
+        "{\"a\":1} tail",
+        "{\"a\":1",
+        "{\"a\":1,}",
+        "{\"a\":01}",
+        "{\"a\":\"\\x\"}",
+        "{\"a\":\"x\x01y\"}",
+        "",
+        " ",
+    };
+    for (size_t k = 0; k < sizeof(damaged) / sizeof(damaged[0]); k++) {
+        CHECK(!parses(damaged[k]));
+        CHECK(!well_formed(damaged[k]));
+    }
+
+    // A surrogate pair parses, and the scan declines it, so a caller that
+    // needs an answer parses whatever the scan does not vouch for.
+    const char *pair = "{\"e\":\"\\ud83d\\ude00\"}";
+    CHECK(parses(pair));
+    CHECK(!well_formed(pair));
+
+    // The record's own object spends the first level of the parser's depth
+    // budget, here as in a field scan.
+    for (size_t nest = 253; nest <= 258; nest++) {
+        char   buf[600];
+        size_t at = 0;
+
+        memcpy(buf + at, "{\"a\":", 5);
+        at += 5;
+        for (size_t i = 0; i < nest; i++) {
+            buf[at++] = '[';
+        }
+        for (size_t i = 0; i < nest; i++) {
+            buf[at++] = ']';
+        }
+        buf[at++] = '}';
+        buf[at]   = '\0';
+
+        CHECK(well_formed(buf) == parses(buf));
+    }
+
+    n00b_printf("  [PASS] a record scans well formed exactly when it parses");
+}
+
 // ---------------------------------------------------------------------------
 // randomized agreement
 // ---------------------------------------------------------------------------
@@ -432,9 +541,13 @@ test_randomized_records_agree(void)
         // generated rather than listed. Most land inside a value, which is
         // where bracket balance alone used to answer.
         if (fuzz_below(2) == 0) {
-            static const char poison[] = ",:{}[]\"01x";
+            static const char poison[] = ",:{}[]\"01x\x01";
             buf[fuzz_below(at)]        = poison[fuzz_below(sizeof(poison) - 1)];
         }
+
+        // No generated record holds a shape the scan declines, so here it
+        // must agree with the parser both ways.
+        CHECK(rocs_json_scan_well_formed(buf, at) == parses(buf));
 
         char field[16];
         snprintf(field, sizeof(field), "k%zu", fuzz_below(fields + 1));
@@ -493,6 +606,9 @@ main(int argc, char **argv)
     test_damage_inside_another_value_is_not_answered();
     test_the_depth_seam_falls_where_the_parser_puts_it();
     test_nesting_past_the_parser_stops_both();
+    test_control_bytes_in_a_string_are_declined();
+    test_numbers_the_parser_refuses_are_declined();
+    test_well_formed_is_what_parses();
     test_randomized_records_agree();
 
     n00b_shutdown();

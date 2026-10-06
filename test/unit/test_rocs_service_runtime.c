@@ -440,9 +440,10 @@ write_whole_file(n00b_string_t *path, n00b_buffer_t *bytes)
         n00b_file_close_result(n00b_result_get(open_r))));
 }
 
-// A ranked hit whose stored record cannot be copied must fail the request
-// with a server error. The query itself still succeeds, since the record
-// text is only read when include_records serializes it.
+// A hit whose stored record is damaged must fail the request with a server
+// error, never reach the client inside a 200. The query itself still
+// succeeds, since the record text is only read when include_records
+// serializes it.
 static void
 test_ranked_serialization_failure_is_an_error(void)
 {
@@ -483,6 +484,14 @@ test_ranked_serialization_failure_is_an_error(void)
         port,
         r"/v1/query",
         r"{\"filter\":{\"contains\":{\"field\":\"message\",\"term\":\"alpha\"}},\"ranked\":true,\"include_records\":true,\"limit\":5}");
+    CHECK(n00b_http_response_status(resp) == 500);
+    check_body_contains(resp, r"\"query_error\"");
+
+    // The snapshot route serves the same stored bytes, so it fails the same way.
+    resp = http_post(
+        port,
+        r"/v1/query",
+        r"{\"filter\":{\"contains\":{\"field\":\"message\",\"term\":\"alpha\"}},\"include_records\":true,\"limit\":5}");
     CHECK(n00b_http_response_status(resp) == 500);
     check_body_contains(resp, r"\"query_error\"");
 
