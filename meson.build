@@ -2403,7 +2403,8 @@ rocs_query_cancel_test = executable('test_rocs_query_cancel',
     ['test/unit/test_rocs_query_cancel.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_query_cancel', rocs_query_cancel_test, suite: 'unit')
+test('rocs_query_cancel', rocs_query_cancel_test, suite: 'unit',
+     timeout: 120)
 
 rocs_ranked_records_test = executable('test_rocs_ranked_records',
     ['test/unit/test_rocs_ranked_records.c'],

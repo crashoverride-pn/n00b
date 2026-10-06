@@ -233,6 +233,15 @@ struct n00b_query_cursor_t {
     bool                       snapshot_prepared;
     bool                       snapshot_use_cache;
     bool                       snapshot_exhausted;
+    // The first error next returned. By then the cursor has moved past what
+    // failed (a snapshot boundary, or a live batch of pending positions) and
+    // may have kept some of its hits, so it cannot resume: every later call
+    // returns this error again. Set once and never cleared, so anything that
+    // resets a cursor must clear both fields. A retention error's payload
+    // comes from the cursor's allocator, and this field keeps it reachable for
+    // as long as the cursor is.
+    bool                       failed;
+    n00b_result_error_t        error;
     // Streaming mode (set via n00b_query_cursor_set_streaming): a consumer that
     // copies each hit's data out (e.g. n00b_query_hit_json_copy) before calling
     // n00b_query_cursor_next again. When set, the snapshot fill path releases the
@@ -5113,6 +5122,13 @@ rocs_query_cursor_stream_recycle(n00b_query_cursor_t *cursor)
     return err;
 }
 
+static void
+rocs_query_cursor_fail(n00b_query_cursor_t *cursor, n00b_result_error_t error)
+{
+    cursor->failed = true;
+    cursor->error  = error;
+}
+
 static n00b_result_t(bool)
 rocs_query_cursor_fill_next_snapshot_boundary(n00b_query_cursor_t *cursor)
 {
@@ -5252,6 +5268,9 @@ rocs_query_cursor_build_remaining_snapshot(n00b_query_cursor_t *cursor)
     if (cursor == nullptr) {
         return n00b_result_err(bool, N00B_QUERY_ERR_ARG);
     }
+    if (cursor->failed) {
+        return n00b_result_err(bool, cursor->error);
+    }
     if (cursor->view == nullptr
         || cursor->view->mode != N00B_QUERY_MODE_SNAPSHOT) {
         return n00b_result_ok(bool, true);
@@ -5260,6 +5279,7 @@ rocs_query_cursor_build_remaining_snapshot(n00b_query_cursor_t *cursor)
     while (!cursor->snapshot_exhausted) {
         auto fill_r = rocs_query_cursor_fill_next_snapshot_boundary(cursor);
         if (n00b_result_is_err(fill_r)) {
+            rocs_query_cursor_fail(cursor, n00b_result_get_error(fill_r));
             return fill_r;
         }
         if (!n00b_result_get(fill_r)) {
@@ -6154,11 +6174,13 @@ rocs_query_rank_shard_new(n00b_query_boundary_entry_t boundary,
 // Looks every term up in the view's hot boundary under one hot shard pin, so
 // all terms read the same shard and a seal waits only for these lookups. The
 // lookup is the index lookup sealed shards get, so a record scores the same
-// before and after it is sealed.
+// before and after it is sealed. The postings walks poll the query's cancel
+// hook, since a seal waits on the pin for as long as they run.
 static n00b_result_t(bool)
 rocs_query_rank_hot_terms(n00b_query_view_t           *view,
                           rocs_query_rank_term_list_t *terms,
                           n00b_plan_index_list_t      *indexes,
+                          n00b_query_t                *query,
                           n00b_allocator_t            *allocator)
 {
     n00b_query_boundary_entry_t boundary = {};
@@ -6187,6 +6209,10 @@ rocs_query_rank_hot_terms(n00b_query_view_t           *view,
     }
     n00b_store_shard_t *hot = n00b_option_get(hot_opt);
 
+    rocs_query_cancel_poll_t poll = {
+        .cancel_cb  = query->cancel_cb,
+        .cancel_ctx = query->cancel_ctx,
+    };
     n00b_err_t err      = N00B_QUERY_OK;
     uint64_t   term_len = (uint64_t)n00b_list_len(*terms);
     for (uint64_t i = 0; i < term_len; i++) {
@@ -6223,9 +6249,7 @@ rocs_query_rank_hot_terms(n00b_query_view_t           *view,
             n00b_result_get(postings_r),
             boundary.record_count,
             true,
-            // The hot-shard walk has no cancel hook plumbed to it; the tick
-            // helper null-checks, so this is a no-op rather than a hazard.
-            nullptr,
+            &poll,
             allocator);
         if (n00b_result_is_err(ordset_r)) {
             err = n00b_result_get_err(ordset_r);
@@ -6626,7 +6650,11 @@ rocs_query_rank_prepare(n00b_query_view_t *view,
     }
     n00b_plan_index_list_t *indexes = n00b_result_get(indexes_r);
 
-    auto hot_r = rocs_query_rank_hot_terms(view, terms, indexes, allocator);
+    auto hot_r = rocs_query_rank_hot_terms(view,
+                                           terms,
+                                           indexes,
+                                           query,
+                                           allocator);
     if (n00b_result_is_err(hot_r)) {
         return n00b_result_err(rocs_query_rank_term_list_t *,
                                n00b_result_get_err(hot_r));
@@ -9246,17 +9274,27 @@ n00b_query_cursor_next(n00b_query_cursor_t *cursor)
     bool live = cursor->view != nullptr
              && cursor->view->mode == N00B_QUERY_MODE_LIVE;
     n00b_result_t(n00b_option_t(n00b_query_hit_t *)) result;
-    if (cursor->view->mode == N00B_QUERY_MODE_LIVE) {
-        result = rocs_query_cursor_next_live(cursor);
-    }
-    else if (cursor->stream_release) {
-        // True streaming: one record materialized, delivered, and freed at a
-        // time (no per-boundary bulk). Non-streaming consumers (e.g.
-        // n00b_query_records) keep the bulk path, which retains the hits.
-        result = rocs_query_cursor_next_snapshot_lazy(cursor);
+    if (cursor->failed) {
+        rocs_query_cursor_invalidate_current(cursor);
+        result = n00b_result_err(n00b_option_t(n00b_query_hit_t *),
+                                 cursor->error);
     }
     else {
-        result = rocs_query_cursor_deliver_built_hit(cursor);
+        if (live) {
+            result = rocs_query_cursor_next_live(cursor);
+        }
+        else if (cursor->stream_release) {
+            // True streaming: one record materialized, delivered, and freed
+            // at a time (no per-boundary bulk). Non-streaming consumers (e.g.
+            // n00b_query_records) keep the bulk path, which retains the hits.
+            result = rocs_query_cursor_next_snapshot_lazy(cursor);
+        }
+        else {
+            result = rocs_query_cursor_deliver_built_hit(cursor);
+        }
+        if (n00b_result_is_err(result)) {
+            rocs_query_cursor_fail(cursor, n00b_result_get_error(result));
+        }
     }
 
     return rocs_query_cursor_finish_next(cursor, live, result);
