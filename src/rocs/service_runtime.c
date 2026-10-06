@@ -11,6 +11,7 @@
 #include "core/pool.h"
 #include "core/runtime.h"
 #include "internal/rocs/index.h"
+#include "internal/rocs/json_field.h"
 #include "net/http/http_service.h"
 #include "parsers/json.h"
 #include "rocs/filter.h"
@@ -154,31 +155,10 @@ rocs_service_runtime_string_empty(n00b_string_t *s)
 static void
 rocs_service_append(n00b_buffer_t *buf, n00b_string_t *s)
 {
-    if (buf == nullptr || s == nullptr) {
+    if (buf == nullptr || s == nullptr || s->u8_bytes == 0) {
         return;
     }
-    n00b_buffer_t *part = n00b_buffer_from_bytes(s->data,
-                                                 (int64_t)s->u8_bytes,
-                                                 .allocator =
-                                                     buf->allocator);
-    n00b_buffer_concat(buf, part);
-    n00b_buffer_free(part);
-    n00b_free(part);
-}
-
-static void
-rocs_service_append_cstr(n00b_buffer_t *buf, const char *s)
-{
-    if (buf == nullptr || s == nullptr) {
-        return;
-    }
-    n00b_buffer_t *part = n00b_buffer_from_bytes(
-        (char *)s,
-        (int64_t)strlen(s),
-        .allocator = buf->allocator);
-    n00b_buffer_concat(buf, part);
-    n00b_buffer_free(part);
-    n00b_free(part);
+    n00b_buffer_append_bytes(buf, s->data, (uint64_t)s->u8_bytes);
 }
 
 static void
@@ -187,8 +167,7 @@ rocs_service_append_u64(n00b_buffer_t *buf, uint64_t value)
     if (buf == nullptr) {
         return;
     }
-    rocs_service_append(buf,
-                        n00b_fmt_uint(value, .allocator = buf->allocator));
+    n00b_buffer_append_uint(buf, value);
 }
 
 static void
@@ -471,6 +450,48 @@ rocs_service_append_memory_body(n00b_buffer_t              *buf,
     rocs_service_append(buf, r"}");
 }
 
+// Per-request scratch. Everything a handler builds for one request, from the
+// parsed body to the query view and the serialized reply, is cut from this pool
+// and released by a single destroy once the reply has been handed over.
+typedef struct {
+    n00b_pool_t       pool;
+    n00b_allocator_t *allocator;
+} rocs_service_scratch_t;
+
+// Query code frees some temporaries without naming their allocator, which only
+// finds the pool when its pages are registered through external metadata. That
+// metadata pool's teardown waits for the next stop-the-world, and a full queue
+// of them forces one, so handlers that build only buffers leave it off.
+static n00b_allocator_t *
+rocs_service_scratch_begin(rocs_service_scratch_t *scratch,
+                           bool                    external_metadata)
+{
+    scratch->allocator = n00b_pool_init(&scratch->pool,
+                                        .hidden            = true,
+                                        .external_metadata = external_metadata,
+                                        .name = "rocs_service_request");
+    return scratch->allocator;
+}
+
+// The response writer borrows its body until after the handler returns, so
+// the body is copied onto the HTTP layer's heap before the pool is destroyed.
+static void
+rocs_service_scratch_reply(rocs_service_scratch_t      *scratch,
+                           n00b_http_response_writer_t *resp,
+                           uint16_t                     status,
+                           n00b_buffer_t               *body,
+                           n00b_string_t               *content_type)
+{
+    n00b_buffer_t *out = n00b_buffer_from_bytes(body->data,
+                                                n00b_buffer_len(body));
+    n00b_allocator_destroy(scratch->allocator);
+    scratch->allocator = nullptr;
+
+    n00b_http_response_writer_status(resp, status);
+    n00b_http_response_writer_header(resp, r"content-type", content_type);
+    n00b_http_response_writer_body(resp, out);
+}
+
 static n00b_buffer_t *
 rocs_service_json_error(n00b_string_t *code,
                         n00b_allocator_t *allocator)
@@ -483,37 +504,29 @@ rocs_service_json_error(n00b_string_t *code,
 }
 
 static void
-rocs_service_write_json(n00b_http_response_writer_t *resp,
-                        uint16_t                    status,
-                        n00b_buffer_t              *body)
+rocs_service_reply_json(rocs_service_scratch_t      *scratch,
+                        n00b_http_response_writer_t *resp,
+                        uint16_t                     status,
+                        n00b_buffer_t               *body)
 {
-    n00b_http_response_writer_status(resp, status);
-    n00b_http_response_writer_header(resp,
-                                     r"content-type",
-                                     r"application/json");
-    n00b_http_response_writer_body(resp, body);
+    rocs_service_scratch_reply(scratch,
+                               resp,
+                               status,
+                               body,
+                               r"application/json");
 }
 
 static void
-rocs_service_write_error(n00b_http_response_writer_t *resp,
-                         uint16_t                    status,
-                         n00b_string_t              *code,
-                         n00b_allocator_t           *allocator)
+rocs_service_reply_error(rocs_service_scratch_t      *scratch,
+                         n00b_http_response_writer_t *resp,
+                         uint16_t                     status,
+                         n00b_string_t               *code)
 {
-    rocs_service_write_json(resp,
+    rocs_service_reply_json(scratch,
+                            resp,
                             status,
-                            rocs_service_json_error(code, allocator));
-}
-
-static void
-rocs_service_write_text(n00b_http_response_writer_t *resp,
-                        uint16_t                    status,
-                        n00b_buffer_t              *body,
-                        n00b_string_t              *content_type)
-{
-    n00b_http_response_writer_status(resp, status);
-    n00b_http_response_writer_header(resp, r"content-type", content_type);
-    n00b_http_response_writer_body(resp, body);
+                            rocs_service_json_error(code,
+                                                    scratch->allocator));
 }
 
 static void
@@ -560,11 +573,10 @@ rocs_service_is_ready(n00b_rocs_service_t *service)
 static n00b_buffer_t *
 rocs_service_health_body(n00b_rocs_service_t *service,
                          n00b_string_t       *status,
-                         bool                 ok)
+                         bool                 ok,
+                         n00b_allocator_t    *allocator)
 {
-    n00b_allocator_t *allocator = service == nullptr ? nullptr
-                                                     : service->allocator;
-    n00b_buffer_t    *buf       = n00b_buffer_new(0, .allocator = allocator);
+    n00b_buffer_t *buf = n00b_buffer_new(0, .allocator = allocator);
     rocs_service_append(buf, r"{\"ok\":");
     rocs_service_append_bool(buf, ok);
     rocs_service_append(buf, r",\"status\":\"");
@@ -594,18 +606,34 @@ rocs_service_health_body(n00b_rocs_service_t *service,
 }
 
 static void
+rocs_service_health_reply(n00b_rocs_service_t         *service,
+                          n00b_http_response_writer_t *resp,
+                          bool                         ok,
+                          n00b_string_t               *status)
+{
+    rocs_service_scratch_t scratch;
+    n00b_allocator_t      *allocator =
+        rocs_service_scratch_begin(&scratch, false);
+    rocs_service_reply_json(&scratch,
+                            resp,
+                            ok ? 200 : 503,
+                            rocs_service_health_body(service,
+                                                     status,
+                                                     ok,
+                                                     allocator));
+}
+
+static void
 rocs_service_startup_handler(n00b_http_request_t         *req,
                              n00b_http_response_writer_t *resp,
                              void                        *user_data)
 {
     n00b_rocs_service_t *service = user_data;
     bool                 ok      = rocs_service_is_started(service);
-    rocs_service_write_json(resp,
-                            ok ? 200 : 503,
-                            rocs_service_health_body(service,
-                                                     ok ? r"started"
-                                                        : r"starting",
-                                                     ok));
+    rocs_service_health_reply(service,
+                              resp,
+                              ok,
+                              ok ? r"started" : r"starting");
 }
 
 static void
@@ -615,11 +643,7 @@ rocs_service_liveness_handler(n00b_http_request_t         *req,
 {
     n00b_rocs_service_t *service = user_data;
     bool ok = service != nullptr && !n00b_atomic_load(&service->stopped);
-    rocs_service_write_json(resp,
-                            ok ? 200 : 503,
-                            rocs_service_health_body(service,
-                                                     ok ? r"alive" : r"closed",
-                                                     ok));
+    rocs_service_health_reply(service, resp, ok, ok ? r"alive" : r"closed");
 }
 
 static void
@@ -629,12 +653,10 @@ rocs_service_readiness_handler(n00b_http_request_t         *req,
 {
     n00b_rocs_service_t *service = user_data;
     bool                 ok      = rocs_service_is_ready(service);
-    rocs_service_write_json(resp,
-                            ok ? 200 : 503,
-                            rocs_service_health_body(service,
-                                                     ok ? r"ready"
-                                                        : r"not_ready",
-                                                     ok));
+    rocs_service_health_reply(service,
+                              resp,
+                              ok,
+                              ok ? r"ready" : r"not_ready");
 }
 
 static void
@@ -723,11 +745,10 @@ rocs_service_trim_residency(n00b_rocs_service_t *service)
 }
 
 static n00b_buffer_t *
-rocs_service_metrics_body(n00b_rocs_service_t *service)
+rocs_service_metrics_body(n00b_rocs_service_t *service,
+                          n00b_allocator_t    *allocator)
 {
-    n00b_allocator_t *allocator = service == nullptr ? nullptr
-                                                     : service->allocator;
-    n00b_buffer_t    *buf       = n00b_buffer_new(0, .allocator = allocator);
+    n00b_buffer_t *buf = n00b_buffer_new(0, .allocator = allocator);
     uint64_t          up        = service != nullptr
                                && !n00b_atomic_load(&service->stopped);
     uint64_t store_errors = service == nullptr ? 0
@@ -972,14 +993,18 @@ rocs_service_metrics_handler(n00b_http_request_t         *req,
                              n00b_http_response_writer_t *resp,
                              void                        *user_data)
 {
-    n00b_rocs_service_t *service = user_data;
+    n00b_rocs_service_t   *service = user_data;
+    rocs_service_scratch_t scratch;
+    n00b_allocator_t      *allocator =
+        rocs_service_scratch_begin(&scratch, false);
     n00b_mutex_lock(&service->store_mutex);
-    n00b_buffer_t *body = rocs_service_metrics_body(service);
+    n00b_buffer_t *body = rocs_service_metrics_body(service, allocator);
     n00b_mutex_unlock(&service->store_mutex);
-    rocs_service_write_text(resp,
-                            200,
-                            body,
-                            r"text/plain; version=0.0.4");
+    rocs_service_scratch_reply(&scratch,
+                               resp,
+                               200,
+                               body,
+                               r"text/plain; version=0.0.4");
 }
 
 static n00b_result_t(rocs_service_bind_t)
@@ -1081,9 +1106,6 @@ rocs_service_filter_value_from_json(n00b_json_node_t     *node,
         return false;
     }
 }
-
-static n00b_result_t(n00b_filter_t *)
-rocs_service_filter_from_filter_json(n00b_json_node_t *filter);
 
 static n00b_result_t(n00b_filter_t *)
 rocs_service_filter_leaf_eq(n00b_json_node_t *eq)
@@ -1225,56 +1247,11 @@ rocs_service_filter_leaf_regex(n00b_json_node_t *regex)
     return filter_r;
 }
 
+// Leaf predicates only. Returns N00B_ROCS_SERVICE_ERR_STATE when the object
+// names no leaf operator, so the caller can try the boolean operators next.
 static n00b_result_t(n00b_filter_t *)
-rocs_service_filter_combine_json(n00b_json_node_t *items_node, bool is_or)
+rocs_service_filter_leaf_json(n00b_json_node_t *filter)
 {
-    if (items_node == nullptr || !n00b_json_is_array(items_node)) {
-        return n00b_result_err(n00b_filter_t *,
-                               N00B_ROCS_SERVICE_ERR_REQUEST);
-    }
-
-    n00b_json_array_t *items = n00b_json_as_array(items_node);
-    if (items == nullptr || n00b_list_len(*items) == 0) {
-        return n00b_result_err(n00b_filter_t *,
-                               N00B_ROCS_SERVICE_ERR_REQUEST);
-    }
-
-    n00b_filter_t *acc = nullptr;
-    for (size_t i = 0; i < n00b_list_len(*items); i++) {
-        auto child_r =
-            rocs_service_filter_from_filter_json(n00b_list_get(*items, i));
-        if (n00b_result_is_err(child_r)) {
-            return child_r;
-        }
-        if (acc == nullptr) {
-            acc = n00b_result_get(child_r);
-            continue;
-        }
-
-        n00b_result_t(n00b_filter_t *) combined_r =
-            is_or ? n00b_filter_or(acc,
-                                   n00b_result_get(child_r),
-                                   kw_func(n00b_filter_or))
-                  : n00b_filter_and(acc,
-                                    n00b_result_get(child_r),
-                                    kw_func(n00b_filter_and));
-        if (n00b_result_is_err(combined_r)) {
-            return n00b_result_err(n00b_filter_t *,
-                                   N00B_ROCS_SERVICE_ERR_REQUEST);
-        }
-        acc = n00b_result_get(combined_r);
-    }
-    return n00b_result_ok(n00b_filter_t *, acc);
-}
-
-static n00b_result_t(n00b_filter_t *)
-rocs_service_filter_from_filter_json(n00b_json_node_t *filter)
-{
-    if (filter == nullptr || !n00b_json_is_object(filter)) {
-        return n00b_result_err(n00b_filter_t *,
-                               N00B_ROCS_SERVICE_ERR_REQUEST);
-    }
-
     n00b_json_node_t *exists = n00b_json_object_get(filter, r"exists");
     if (exists != nullptr) {
         return rocs_service_filter_field(exists);
@@ -1332,6 +1309,78 @@ rocs_service_filter_from_filter_json(n00b_json_node_t *filter)
         return rocs_service_filter_leaf_regex(regex);
     }
 
+    return n00b_result_err(n00b_filter_t *, N00B_ROCS_SERVICE_ERR_STATE);
+}
+
+static n00b_result_t(n00b_filter_ir_t *)
+rocs_service_filter_ir_json(n00b_json_node_t *filter);
+
+// An "and"/"or" array becomes one n-ary node, so its width does not count
+// toward N00B_FILTER_MAX_DEPTH. A single-element array is its element.
+static n00b_result_t(n00b_filter_ir_t *)
+rocs_service_filter_combine_json(n00b_json_node_t *items_node, bool is_or)
+{
+    if (items_node == nullptr || !n00b_json_is_array(items_node)) {
+        return n00b_result_err(n00b_filter_ir_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    n00b_json_array_t *items = n00b_json_as_array(items_node);
+    size_t             len   = items == nullptr ? 0 : n00b_list_len(*items);
+    if (len == 0) {
+        return n00b_result_err(n00b_filter_ir_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+    if (len == 1) {
+        return rocs_service_filter_ir_json(n00b_list_get(*items, 0));
+    }
+
+    n00b_filter_ir_child_list_t *children = n00b_filter_ir_child_list_new();
+    for (size_t i = 0; i < len; i++) {
+        auto child_r = rocs_service_filter_ir_json(n00b_list_get(*items, i));
+        if (n00b_result_is_err(child_r)) {
+            return child_r;
+        }
+        auto append_r = n00b_filter_ir_child_list_append(
+            children,
+            n00b_result_get(child_r));
+        if (n00b_result_is_err(append_r)) {
+            return n00b_result_err(n00b_filter_ir_t *,
+                                   N00B_ROCS_SERVICE_ERR_REQUEST);
+        }
+    }
+
+    n00b_filter_ir_t *node = is_or ? n00b_filter_ir_or(children)
+                                   : n00b_filter_ir_and(children);
+    if (node == nullptr) {
+        return n00b_result_err(n00b_filter_ir_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+    return n00b_result_ok(n00b_filter_ir_t *, node);
+}
+
+static n00b_result_t(n00b_filter_ir_t *)
+rocs_service_filter_ir_json(n00b_json_node_t *filter)
+{
+    if (filter == nullptr || !n00b_json_is_object(filter)) {
+        return n00b_result_err(n00b_filter_ir_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    auto leaf_r = rocs_service_filter_leaf_json(filter);
+    if (n00b_result_is_ok(leaf_r)) {
+        auto ir_r = n00b_filter_to_ir(n00b_result_get(leaf_r));
+        if (n00b_result_is_err(ir_r)) {
+            return n00b_result_err(n00b_filter_ir_t *,
+                                   N00B_ROCS_SERVICE_ERR_REQUEST);
+        }
+        return ir_r;
+    }
+    if (n00b_result_get_err(leaf_r) != N00B_ROCS_SERVICE_ERR_STATE) {
+        return n00b_result_err(n00b_filter_ir_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
     n00b_json_node_t *and_node = n00b_json_object_get(filter, r"and");
     if (and_node != nullptr) {
         return rocs_service_filter_combine_json(and_node, false);
@@ -1342,15 +1391,26 @@ rocs_service_filter_from_filter_json(n00b_json_node_t *filter)
         return rocs_service_filter_combine_json(or_node, true);
     }
 
-    return n00b_result_err(n00b_filter_t *,
+    return n00b_result_err(n00b_filter_ir_t *,
                            N00B_ROCS_SERVICE_ERR_REQUEST);
 }
 
 static n00b_result_t(n00b_filter_t *)
 rocs_service_filter_from_json(n00b_json_node_t *root)
 {
-    return rocs_service_filter_from_filter_json(
+    auto ir_r = rocs_service_filter_ir_json(
         n00b_json_object_get(root, r"filter"));
+    if (n00b_result_is_err(ir_r)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+
+    auto filter_r = n00b_filter_from_ir(n00b_result_get(ir_r));
+    if (n00b_result_is_err(filter_r)) {
+        return n00b_result_err(n00b_filter_t *,
+                               N00B_ROCS_SERVICE_ERR_REQUEST);
+    }
+    return filter_r;
 }
 
 static n00b_result_t(uint64_t)
@@ -1358,7 +1418,7 @@ rocs_service_query_limit(n00b_json_node_t *root)
 {
     n00b_json_node_t *limit = n00b_json_object_get(root, r"limit");
     if (limit == nullptr) {
-        return n00b_result_ok(uint64_t, 100);
+        return n00b_result_ok(uint64_t, N00B_ROCS_SERVICE_DEFAULT_QUERY_LIMIT);
     }
     if (!n00b_json_is_int(limit) || n00b_json_as_i64(limit) < 0) {
         return n00b_result_err(uint64_t, N00B_ROCS_SERVICE_ERR_REQUEST);
@@ -1426,6 +1486,26 @@ rocs_service_query_resume(n00b_json_node_t *root)
     return n00b_result_ok(rocs_service_resume_t, out);
 }
 
+// Stored bytes reach the client unparsed, so damaged ones must fail the
+// request rather than corrupt a 200 body. The scan settles nearly every
+// record, and a parse settles the shapes it declines.
+static bool
+rocs_service_record_well_formed(n00b_string_t    *json,
+                                n00b_allocator_t *allocator)
+{
+    if (rocs_json_scan_well_formed(json->data, json->u8_bytes)) {
+        return true;
+    }
+
+    const char *err = nullptr;
+    return n00b_json_parse(json->data,
+                           json->u8_bytes,
+                           &err,
+                           .allocator = allocator)
+            != nullptr
+        && err == nullptr;
+}
+
 static bool
 rocs_service_append_query_hit(n00b_buffer_t      *buf,
                               n00b_query_hit_t   *hit,
@@ -1453,24 +1533,16 @@ rocs_service_append_query_hit(n00b_buffer_t      *buf,
     rocs_service_append(buf, r",\"score\":");
     rocs_service_append_f64(buf, score);
     if (include_records) {
-        auto record_r = n00b_query_hit_record(hit);
-        if (n00b_result_is_err(record_r)) {
-            return false;
-        }
-        auto json_r =
-            n00b_store_record_view_json_copy(n00b_result_get(record_r),
-                                             .allocator = allocator);
-        if (n00b_result_is_err(json_r)) {
-            return false;
-        }
-        char *encoded = n00b_json_encode(n00b_result_get(json_r),
-                                         .allocator = allocator);
-        if (encoded == nullptr) {
+        // Sealed records come back as their stored compact JSON bytes, with
+        // no parse, node graph, or re-encode.
+        auto json_r = n00b_query_hit_json_string(hit, .allocator = allocator);
+        if (n00b_result_is_err(json_r)
+            || !rocs_service_record_well_formed(n00b_result_get(json_r),
+                                                allocator)) {
             return false;
         }
         rocs_service_append(buf, r",\"record\":");
-        rocs_service_append_cstr(buf, encoded);
-        n00b_free(encoded);
+        rocs_service_append(buf, n00b_result_get(json_r));
     }
     rocs_service_append(buf, r"}");
     return true;
@@ -1562,12 +1634,6 @@ rocs_service_query_page_response(n00b_store_t     *store,
                                  n00b_allocator_t *allocator)
 {
     n00b_buffer_t *buf = n00b_buffer_new(0, .allocator = allocator);
-
-    if (limit == 0) {
-        rocs_service_append(buf,
-                            r"{\"ok\":true,\"hits\":[],\"count\":0,\"more\":false,\"next_resume\":\"\"}");
-        return n00b_result_ok(n00b_buffer_t *, buf);
-    }
 
     uint64_t         view_limit = limit + 1;
     n00b_store_pos_t *resume_ptr =
@@ -1768,10 +1834,13 @@ rocs_service_query_handler(n00b_http_request_t        *req,
                            n00b_http_response_writer_t *resp,
                            void                       *user_data)
 {
-    n00b_rocs_service_t *service = user_data;
+    n00b_rocs_service_t   *service = user_data;
+    rocs_service_scratch_t scratch;
+    n00b_allocator_t      *allocator =
+        rocs_service_scratch_begin(&scratch, true);
     if (service == nullptr || n00b_atomic_load(&service->stopped)
         || service->store == nullptr) {
-        rocs_service_write_error(resp, 503, r"service_closed", nullptr);
+        rocs_service_reply_error(&scratch, resp, 503, r"service_closed");
         return;
     }
 
@@ -1781,24 +1850,17 @@ rocs_service_query_handler(n00b_http_request_t        *req,
     n00b_buffer_t *body = n00b_http_request_body(req);
     if (body == nullptr || n00b_buffer_len(body) == 0) {
         rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
 
     n00b_json_node_t *root = n00b_json_parse(body->data,
                                              n00b_buffer_len(body),
                                              nullptr,
-                                             .allocator =
-                                                 service->allocator);
+                                             .allocator = allocator);
     if (root == nullptr || !n00b_json_is_object(root)) {
         rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
 
@@ -1812,15 +1874,35 @@ rocs_service_query_handler(n00b_http_request_t        *req,
         || n00b_result_is_err(include_records_r)
         || n00b_result_is_err(resume_r)) {
         rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
+        return;
+    }
+
+    uint64_t limit = n00b_result_get(limit_r);
+    if (limit > N00B_ROCS_SERVICE_MAX_QUERY_LIMIT) {
+        rocs_service_finish_query(service, start_ns, true);
+        rocs_service_reply_error(&scratch, resp, 400, r"limit_too_large");
         return;
     }
 
     bool ranked = n00b_result_get(ranked_r);
     rocs_service_resume_t resume = n00b_result_get(resume_r);
+    if (ranked && resume.has_resume) {
+        rocs_service_finish_query(service, start_ns, true);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
+        return;
+    }
+    if (limit == 0) {
+        n00b_buffer_t *empty = n00b_buffer_new(0, .allocator = allocator);
+        rocs_service_append(
+            empty,
+            ranked ? r"{\"ok\":true,\"count\":0,\"hits\":[]}"
+                   : r"{\"ok\":true,\"hits\":[],\"count\":0,\"more\":false,\"next_resume\":\"\"}");
+        rocs_service_finish_query(service, start_ns, false);
+        rocs_service_reply_json(&scratch, resp, 200, empty);
+        return;
+    }
+
     if (!ranked) {
         n00b_mutex_lock(&service->store_mutex);
         /* Started AFTER the lock: the budget is a bound on how long one query
@@ -1833,41 +1915,32 @@ rocs_service_query_handler(n00b_http_request_t        *req,
         auto page_r =
             rocs_service_query_page_response(service->store,
                                              n00b_result_get(filter_r),
-                                             n00b_result_get(limit_r),
+                                             limit,
                                              resume,
                                              n00b_result_get(include_records_r),
                                              &page_deadline_ns,
-                                             service->allocator);
+                                             allocator);
         if (n00b_result_is_err(page_r)) {
             n00b_mutex_unlock(&service->store_mutex);
             n00b_rocs_service_err_t page_err = n00b_result_get_err(page_r);
             bool bad_request = page_err == N00B_ROCS_SERVICE_ERR_REQUEST;
             bool timed_out   = page_err == N00B_ROCS_SERVICE_ERR_TIMEOUT;
             rocs_service_finish_query(service, start_ns, true);
-            rocs_service_write_error(resp,
+            rocs_service_reply_error(&scratch,
+                                     resp,
                                      bad_request  ? 400
                                      : timed_out  ? 504
                                                   : 500,
                                      bad_request  ? r"bad_request"
                                      : timed_out  ? r"query_timeout"
-                                                  : r"query_error",
-                                     service->allocator);
+                                                  : r"query_error");
             return;
         }
 
         rocs_service_trim_residency(service);
         n00b_mutex_unlock(&service->store_mutex);
         rocs_service_finish_query(service, start_ns, false);
-        rocs_service_write_json(resp, 200, n00b_result_get(page_r));
-        return;
-    }
-
-    if (resume.has_resume) {
-        rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_json(&scratch, resp, 200, n00b_result_get(page_r));
         return;
     }
 
@@ -1891,45 +1964,43 @@ rocs_service_query_handler(n00b_http_request_t        *req,
     uint64_t query_deadline_ns = UINT64_MAX;
 
     auto query_r = n00b_query_new(n00b_result_get(filter_r),
-                                  .limit      = n00b_result_get(limit_r),
+                                  .limit      = limit,
                                   .ranked     = ranked,
                                   .cancel_cb  = rocs_service_query_expired,
                                   .cancel_ctx = &query_deadline_ns);
     if (n00b_result_is_err(query_r)) {
         rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
 
     n00b_mutex_lock(&service->store_mutex);
     query_deadline_ns = base_monotonic_ns() + ROCS_SERVICE_QUERY_BUDGET_NS;
-    auto result_r = n00b_query_run(service->store, n00b_result_get(query_r));
+    // Passing the request pool also routes the map view handles each hit
+    // derives there; without it they default to the store's allocator.
+    auto result_r = n00b_query_run(service->store,
+                                   n00b_result_get(query_r),
+                                   .allocator = allocator);
     if (n00b_result_is_err(result_r)) {
         bool timed_out = n00b_result_get_err(result_r)
                          == N00B_QUERY_ERR_CANCELED;
         n00b_mutex_unlock(&service->store_mutex);
         rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
+        rocs_service_reply_error(&scratch,
+                                 resp,
                                  timed_out ? 504 : 500,
                                  timed_out ? r"query_timeout"
-                                           : r"query_error",
-                                 service->allocator);
+                                           : r"query_error");
         return;
     }
 
     n00b_query_result_t *result = n00b_result_get(result_r);
-    auto records_r = n00b_query_records(result);
+    auto records_r = n00b_query_records(result, .allocator = allocator);
     if (n00b_result_is_err(records_r)) {
         (void)n00b_query_result_close(result);
         n00b_mutex_unlock(&service->store_mutex);
         rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 500,
-                                 r"query_error",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 500, r"query_error");
         return;
     }
 
@@ -1938,24 +2009,27 @@ rocs_service_query_handler(n00b_http_request_t        *req,
                                     n00b_result_get(records_r),
                                     n00b_result_get(include_records_r),
                                     &query_deadline_ns,
-                                    service->allocator);
+                                    // Per-request scratch, not the service
+                                    // allocator: that is this PR's point. The
+                                    // deadline arg is n00b#472's and is kept.
+                                    allocator);
     (void)n00b_query_result_close(result);
     if (n00b_result_is_err(out_r)) {
         bool timed_out = n00b_result_get_err(out_r)
                          == N00B_ROCS_SERVICE_ERR_TIMEOUT;
         n00b_mutex_unlock(&service->store_mutex);
         rocs_service_finish_query(service, start_ns, true);
-        rocs_service_write_error(resp,
+        rocs_service_reply_error(&scratch,
+                                 resp,
                                  timed_out ? 504 : 500,
                                  timed_out ? r"query_timeout"
-                                           : r"query_error",
-                                 service->allocator);
+                                           : r"query_error");
         return;
     }
     rocs_service_trim_residency(service);
     n00b_mutex_unlock(&service->store_mutex);
     rocs_service_finish_query(service, start_ns, false);
-    rocs_service_write_json(resp, 200, n00b_result_get(out_r));
+    rocs_service_reply_json(&scratch, resp, 200, n00b_result_get(out_r));
 }
 
 static void
@@ -1963,10 +2037,12 @@ rocs_service_records_handler(n00b_http_request_t        *req,
                              n00b_http_response_writer_t *resp,
                              void                       *user_data)
 {
-    n00b_rocs_service_t *service = user_data;
+    n00b_rocs_service_t   *service = user_data;
+    rocs_service_scratch_t scratch;
+    (void)rocs_service_scratch_begin(&scratch, false);
     if (service == nullptr || n00b_atomic_load(&service->stopped)
         || service->store == nullptr) {
-        rocs_service_write_error(resp, 503, r"service_closed", nullptr);
+        rocs_service_reply_error(&scratch, resp, 503, r"service_closed");
         return;
     }
 
@@ -1975,17 +2051,14 @@ rocs_service_records_handler(n00b_http_request_t        *req,
 
     if (service->read_only) {
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp, 403, r"read_only", service->allocator);
+        rocs_service_reply_error(&scratch, resp, 403, r"read_only");
         return;
     }
 
     n00b_buffer_t *body = n00b_http_request_body(req);
     if (body == nullptr || n00b_buffer_len(body) == 0) {
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
 
@@ -1995,17 +2068,14 @@ rocs_service_records_handler(n00b_http_request_t        *req,
     if (n00b_result_is_err(ingest_r)) {
         rocs_service_record_store_error(service, n00b_result_get_err(ingest_r));
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
     n00b_buffer_t *out = n00b_buffer_new(0,
-                                         .allocator = service->allocator);
+                                         .allocator = scratch.allocator);
     rocs_service_append(out, r"{\"ok\":true}");
     rocs_service_finish_ingest(service, start_ns, false);
-    rocs_service_write_json(resp, 200, out);
+    rocs_service_reply_json(&scratch, resp, 200, out);
 }
 
 static void
@@ -2013,10 +2083,13 @@ rocs_service_records_batch_handler(n00b_http_request_t        *req,
                                    n00b_http_response_writer_t *resp,
                                    void                       *user_data)
 {
-    n00b_rocs_service_t *service = user_data;
+    n00b_rocs_service_t   *service = user_data;
+    rocs_service_scratch_t scratch;
+    n00b_allocator_t      *allocator =
+        rocs_service_scratch_begin(&scratch, false);
     if (service == nullptr || n00b_atomic_load(&service->stopped)
         || service->store == nullptr) {
-        rocs_service_write_error(resp, 503, r"service_closed", nullptr);
+        rocs_service_reply_error(&scratch, resp, 503, r"service_closed");
         return;
     }
 
@@ -2025,79 +2098,55 @@ rocs_service_records_batch_handler(n00b_http_request_t        *req,
 
     if (service->read_only) {
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp, 403, r"read_only", service->allocator);
+        rocs_service_reply_error(&scratch, resp, 403, r"read_only");
         return;
     }
 
     n00b_buffer_t *body = n00b_http_request_body(req);
     if (body == nullptr || n00b_buffer_len(body) == 0) {
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
 
-    n00b_pool_t       source_pool = {};
-    n00b_allocator_t *source_allocator =
-        n00b_pool_init(&source_pool,
-                       .hidden = true,
-                       .name   = "rocs_service_batch_sources");
-    auto sources_r = rocs_service_ndjson_sources(body, source_allocator);
+    auto sources_r = rocs_service_ndjson_sources(body, allocator);
     if (n00b_result_is_err(sources_r)) {
-        n00b_allocator_destroy(source_allocator);
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
 
     n00b_store_source_list_t *sources = n00b_result_get(sources_r);
     uint64_t                 count   = (uint64_t)n00b_list_len(*sources);
     if (count == 0) {
-        n00b_allocator_destroy(source_allocator);
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
 
     n00b_mutex_lock(&service->store_mutex);
     auto ingest_r = n00b_store_ingest_buf_batch(service->store, sources);
     n00b_mutex_unlock(&service->store_mutex);
-    n00b_allocator_destroy(source_allocator);
     if (n00b_result_is_err(ingest_r)) {
         rocs_service_record_store_error(service, n00b_result_get_err(ingest_r));
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 400,
-                                 r"bad_request",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 400, r"bad_request");
         return;
     }
 
     uint64_t committed = n00b_result_get(ingest_r);
     if (committed != count) {
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 500,
-                                 r"partial_ingest",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 500, r"partial_ingest");
         return;
     }
 
-    n00b_buffer_t *out = n00b_buffer_new(0,
-                                         .allocator = service->allocator);
+    n00b_buffer_t *out = n00b_buffer_new(0, .allocator = allocator);
     rocs_service_append(out, r"{\"ok\":true,\"ingested\":");
     rocs_service_append_u64(out, committed);
     rocs_service_append(out, r"}");
     rocs_service_finish_ingest(service, start_ns, false);
-    rocs_service_write_json(resp, 200, out);
+    rocs_service_reply_json(&scratch, resp, 200, out);
 }
 
 static void
@@ -2106,10 +2155,12 @@ rocs_service_flush_handler(n00b_http_request_t        *req,
                            void                       *user_data)
 {
     (void)req;
-    n00b_rocs_service_t *service = user_data;
+    n00b_rocs_service_t   *service = user_data;
+    rocs_service_scratch_t scratch;
+    (void)rocs_service_scratch_begin(&scratch, false);
     if (service == nullptr || n00b_atomic_load(&service->stopped)
         || service->store == nullptr) {
-        rocs_service_write_error(resp, 503, r"service_closed", nullptr);
+        rocs_service_reply_error(&scratch, resp, 503, r"service_closed");
         return;
     }
 
@@ -2118,7 +2169,7 @@ rocs_service_flush_handler(n00b_http_request_t        *req,
 
     if (service->read_only) {
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp, 403, r"read_only", service->allocator);
+        rocs_service_reply_error(&scratch, resp, 403, r"read_only");
         return;
     }
 
@@ -2128,18 +2179,15 @@ rocs_service_flush_handler(n00b_http_request_t        *req,
     if (n00b_result_is_err(flush_r)) {
         rocs_service_record_store_error(service, n00b_result_get_err(flush_r));
         rocs_service_finish_ingest(service, start_ns, true);
-        rocs_service_write_error(resp,
-                                 500,
-                                 r"store_error",
-                                 service->allocator);
+        rocs_service_reply_error(&scratch, resp, 500, r"store_error");
         return;
     }
 
     n00b_buffer_t *out = n00b_buffer_new(0,
-                                         .allocator = service->allocator);
+                                         .allocator = scratch.allocator);
     rocs_service_append(out, r"{\"ok\":true}");
     rocs_service_finish_ingest(service, start_ns, false);
-    rocs_service_write_json(resp, 200, out);
+    rocs_service_reply_json(&scratch, resp, 200, out);
 }
 
 static n00b_result_t(bool)
@@ -2227,6 +2275,7 @@ n00b_rocs_service_err_str(n00b_err_t err)
     case N00B_ROCS_SERVICE_ERR_READ_ONLY: return r"READ_ONLY";
     case N00B_ROCS_SERVICE_ERR_REQUEST:   return r"REQUEST";
     case N00B_ROCS_SERVICE_ERR_QUERY:     return r"QUERY";
+    case N00B_ROCS_SERVICE_ERR_TIMEOUT:   return r"TIMEOUT";
     }
     return r"UNKNOWN";
 }

@@ -2517,7 +2517,19 @@ rocs_service_runtime_test = executable('test_rocs_service_runtime',
     ['test/unit/test_rocs_service_runtime.c'],
     kwargs: test_common_kwargs,
 )
-test('rocs_service_runtime', rocs_service_runtime_test, suite: 'unit')
+# This PR's allocator-growth case issues ~1360 HTTP requests, each a fresh
+# connection -- far more than any sibling service test, which run 1-12s on
+# the Windows lane.
+#
+# Measured, not guessed: 3.6s on an idle aarch64 Linux box, but 60.2s on
+# x86_64 Windows Server 2022 running alone. That is already past meson's 30s
+# default before CI's four-way parallelism, which is why the Windows lane
+# reported TIMEOUT 30.10s.
+#
+# 180 leaves headroom over the measured 60s and matches the other tests that
+# do real work: rocs_seal_bench, rocs_term_summary, rocs_catalog_index.
+test('rocs_service_runtime', rocs_service_runtime_test, suite: 'unit',
+     timeout: 180)
 
 rocs_service_health_test = executable('test_rocs_service_health',
     ['test/unit/test_rocs_service_health.c'],

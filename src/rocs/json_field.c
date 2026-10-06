@@ -188,6 +188,10 @@ json_scan_string(const char *d, size_t len, size_t *i, bool *escaped)
             (*i)++;
             return true;
         }
+        // The parser rejects an unescaped control character in a string.
+        if ((unsigned char)c < 0x20) {
+            return false;
+        }
         (*i)++;
     }
 
@@ -217,6 +221,12 @@ json_scan_word(const char *d, size_t len, size_t *i, const char *word)
     return true;
 }
 
+// The parser refuses a number of 64 bytes or more, and one out of a double's
+// range. Below 64 bytes with at most a two-digit exponent, a magnitude stays
+// between 1e-160 and 1e162, so the scan declines anything longer.
+#define ROCS_JSON_SCAN_MAX_NUMBER 63
+#define ROCS_JSON_SCAN_MAX_EXP    2
+
 // JSON's number grammar, spelled out. Taking any run of bytes that is not a
 // delimiter would accept `12x3` and `tru`, which the parser rejects, and a
 // record that scans clean and parses as an error is the whole thing this is
@@ -224,6 +234,8 @@ json_scan_word(const char *d, size_t len, size_t *i, const char *word)
 static bool
 json_scan_number(const char *d, size_t len, size_t *i)
 {
+    size_t start = *i;
+
     if (*i < len && d[*i] == '-') {
         (*i)++;
     }
@@ -264,12 +276,18 @@ json_scan_number(const char *d, size_t len, size_t *i)
         if (*i >= len || d[*i] < '0' || d[*i] > '9') {
             return false;
         }
+
+        size_t exp_start = *i;
+
         while (*i < len && d[*i] >= '0' && d[*i] <= '9') {
             (*i)++;
         }
+        if (*i - exp_start > ROCS_JSON_SCAN_MAX_EXP) {
+            return false;
+        }
     }
 
-    return true;
+    return *i - start <= ROCS_JSON_SCAN_MAX_NUMBER;
 }
 
 // The opening brace is already consumed. Keys must be strings, pairs must be
@@ -399,6 +417,24 @@ json_scan_value(const char *d, size_t len, size_t *i, size_t depth)
 
     // Punctuation where a value belongs, as in `{"a":1,"b":}`.
     return false;
+}
+
+bool
+rocs_json_scan_well_formed(const char *data, size_t len)
+{
+    if (data == nullptr) {
+        return false;
+    }
+
+    size_t i = 0;
+
+    // Depth 0 is outside any container, so a record's own object spends the
+    // first level of the parser's budget.
+    if (!json_scan_value(data, len, &i, 0)) {
+        return false;
+    }
+
+    return !json_scan_skip_ws(data, len, &i);
 }
 
 // One pass over a flat object, looking for several keys at once. The object's
