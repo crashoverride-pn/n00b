@@ -89,10 +89,12 @@ struct n00b_conduit_service {
     n00b_conduit_job_t          *job_tail;
     n00b_condition_t             job_cv;
     _Atomic(int)                 worker_threads;
-    /* Guarded by job_cv's lock: jobs waiting in the queue, and workers
-     * waiting for one. */
+    /* Guarded by job_cv's lock: jobs waiting in the queue, workers
+     * waiting for one, and workers a growing submit has started that
+     * have not yet come up idle. */
     int                          queued_jobs;
     int                          idle_workers;
+    int                          starting_workers;
     /* Held while a worker is registered and spawned, and while stop marks
      * the service shut down and counts its threads, so stop joins every
      * worker that is ever added. */
@@ -205,8 +207,8 @@ n00b_conduit_service_submit(n00b_conduit_service_t *svc,
  * @return As for @ref n00b_conduit_service_submit.
  */
 #ifdef N00B_DEBUG
-/* Test hook: runs in n00b_conduit_service_submit_grow after its shutdown
- * check, before it adds a worker. */
+/* Test hook: runs in n00b_conduit_service_submit_grow after it has queued
+ * its job and decided to grow, before it adds the worker. */
 extern void (*n00b_conduit_test_before_grow)(n00b_conduit_service_t *svc);
 #endif
 
