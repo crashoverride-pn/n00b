@@ -6,8 +6,8 @@
  * pipeline for observation/tapping — subscribers that want to see
  * what was written to a topic.
  *
- * After each managed owner write, publishes the originating topic pointer to the
- * upstream topic's done_topic so synchronous callers can unblock.
+ * The transform framework signals the upstream topic's done_topic after each
+ * buffer this sink handles, so synchronous callers can unblock.
  */
 
 #include "conduit/fd_writer.h"

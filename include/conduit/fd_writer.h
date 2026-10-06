@@ -7,9 +7,9 @@
  * `n00b_init()` for stdout (fd 1) and stderr (fd 2), and available for
  * user code to wire up additional managed fd outputs.
  *
- * After each successful managed owner write, the transform framework
- * publishes the originating topic pointer (`n00b_conduit_topic_base_t *`)
- * to the upstream topic's `done_topic`.  Synchronous writers subscribe
+ * After each buffer the sink handles, written or not, the transform
+ * framework publishes the originating topic pointer
+ * (`n00b_conduit_topic_base_t *`) to the upstream topic's `done_topic`.  Synchronous writers subscribe
  * one-shot to that done topic and wait on the inbox CV.
  *
  * ### Usage
@@ -42,8 +42,8 @@ typedef struct {
  * `n00b_buffer_t *` it receives, writes through the fd owner.
  * It never emits downstream output (pure sink).
  *
- * After each write, a completion signal is published to
- * `upstream->done_topic` so synchronous callers can unblock.
+ * After each buffer, the transform framework publishes a completion
+ * signal to `upstream->done_topic` so synchronous callers can unblock.
  *
  * @param c        Conduit instance.
  * @param upstream Upstream topic producing `n00b_buffer_t *` payloads.
