@@ -258,8 +258,9 @@ n00b_buffer_resize(n00b_buffer_t *buffer, uint64_t new_sz)
     defer_on();
     n00b_buffer_acquire_w(buffer);
 
-    // A mapping's byte_len is its mapped length, which munmap needs later.
-    if ((int64_t)new_sz <= (int64_t)buffer->alloc_len && !(buffer->flags & N00B_BUF_F_MMAP)) {
+    // An aliasing buffer is copied before any change. For a mapping this also
+    // keeps byte_len at the mapped length, which munmap needs.
+    if ((int64_t)new_sz <= (int64_t)buffer->alloc_len && !(buffer->flags & BUFFER_ALIASES)) {
         buffer->byte_len = new_sz;
         Return;
     }
@@ -303,7 +304,7 @@ n00b_buffer_append_bytes(n00b_buffer_t *buffer, const void *src, uint64_t len)
     uint64_t old_len = buffer->byte_len;
     uint64_t needed  = old_len + len;
 
-    if (needed > (uint64_t)buffer->alloc_len) {
+    if (needed > (uint64_t)buffer->alloc_len || (buffer->flags & BUFFER_ALIASES)) {
         uint64_t new_alloc = n00b_align_closest_pow2_ceil(needed);
         char    *new_data  = n00b_alloc_array_with_opts(
             char,
@@ -427,7 +428,7 @@ n00b_buffer_concat(n00b_buffer_t *dst, n00b_buffer_t *src) _kargs
     size_t   old_len = dst->byte_len;
     uint64_t needed  = old_len + src->byte_len;
 
-    if (needed > dst->alloc_len) {
+    if (needed > dst->alloc_len || (dst->flags & BUFFER_ALIASES)) {
         uint64_t new_alloc = n00b_align_closest_pow2_ceil(needed);
         char    *new_data  = n00b_alloc_array_with_opts(
             char, new_alloc,

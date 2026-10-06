@@ -3718,6 +3718,12 @@ container_scan_kind_test = executable('test_container_scan_kind',
 )
 test('container_scan_kind', container_scan_kind_test, suite: 'unit')
 
+buffer_mutators_test = executable('test_buffer_mutators',
+    ['test/unit/test_buffer_mutators.c'],
+    kwargs: test_common_kwargs,
+)
+test('buffer_mutators', buffer_mutators_test, suite: 'unit')
+
 finalizer_test = executable('test_finalizer',
     ['test/unit/test_finalizer.c'],
     kwargs: test_common_kwargs,
