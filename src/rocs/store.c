@@ -892,6 +892,14 @@ n00b_store_range_prepare_fail_hook_set(n00b_store_range_prepare_fail_hook_t hook
     rocs_store_range_prepare_fail_hook_ctx = ctx;
     rocs_store_range_prepare_fail_hook     = hook;
 }
+
+static bool rocs_store_range_cancel_fails = false;
+
+void
+n00b_store_range_cancel_fails_set(bool fails)
+{
+    rocs_store_range_cancel_fails = fails;
+}
 #endif
 
 static void
@@ -8974,6 +8982,8 @@ rocs_store_ingest_prepared_range_unlocked(
     // the journal is on. A failure stops there: the slots before it are
     // committed, which keeps the journal and the shard in agreement, and the
     // rest of the reservation is released so later records still publish.
+    // A rest that cannot be released stays reserved; the prefix is committed
+    // all the same, and the range reports the failure that stopped it.
     uint64_t   total_byte_delta = 0;
     uint64_t   ready            = count;
     n00b_err_t prepare_err      = N00B_STORE_OK;
@@ -9053,18 +9063,17 @@ rocs_store_ingest_prepared_range_unlocked(
         }
     }
 
+    bool tail_held = false;
     if (ready < count) {
-        auto cancel_r = n00b_store_shard_cancel_tail_reservation(
-            store->hot_shard,
-            start + ready,
-            count - ready);
-        if (n00b_result_is_err(cancel_r)) {
-            while (begun != 0) {
-                rocs_store_hot_writer_end_unlocked(store);
-                begun--;
-            }
-            return n00b_result_err(uint64_t, N00B_STORE_ERR_INTERNAL);
-        }
+        bool cancel = true;
+#ifdef N00B_DEBUG
+        cancel = !rocs_store_range_cancel_fails;
+#endif
+        tail_held = !cancel
+                 || n00b_result_is_err(n00b_store_shard_cancel_tail_reservation(
+                        store->hot_shard,
+                        start + ready,
+                        count - ready));
         while (begun > ready) {
             rocs_store_hot_writer_end_unlocked(store);
             begun--;
@@ -9138,6 +9147,10 @@ rocs_store_ingest_prepared_range_unlocked(
     while (begun != 0) {
         rocs_store_hot_writer_end_unlocked(store);
         begun--;
+    }
+
+    if (tail_held) {
+        return n00b_result_err(uint64_t, prepare_err);
     }
 
     if (!store->recovering && rocs_store_should_seal_hot(store)) {

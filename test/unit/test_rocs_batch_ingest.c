@@ -1034,6 +1034,86 @@ test_worker_range_tombstone_survives_an_index_failure(void)
 }
 #endif
 
+#ifdef N00B_DEBUG
+typedef struct {
+    n00b_vfs_t                   *vfs;
+    n00b_store_t                 *store;
+    n00b_result_t(uint64_t)       batch_r;
+} held_tail_t;
+
+// The second journal write fails and the unready tail cannot be canceled,
+// so the range's last two slots stay reserved.
+static held_tail_t
+batch_with_a_held_tail(void)
+{
+    held_tail_t       out   = {};
+    n00b_vfs_mount_t *mount = nullptr;
+    out.vfs   = new_memory_vfs(.mount_out = &mount);
+    out.store = open_store(schema_with_level(false, N00B_STORE_INDEX_TERM),
+                           .vfs              = out.vfs,
+                           .recovery_journal = true);
+
+    static fail_journal_write_t fail_journal;
+    fail_journal = (fail_journal_write_t){.enabled = false, .allowed = 1};
+    CHECK(n00b_result_is_ok(n00b_vfs_hook_add(mount,
+                                              N00B_VFS_HOOK_PRE_WRITE,
+                                              deny_journal_write,
+                                              &fail_journal,
+                                              0)));
+
+    n00b_store_source_list_t *sources = source_list_new();
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"ht-a\"}"));
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"ht-b\"}"));
+    n00b_list_push(*sources, buffer_from_literal("{\"level\":\"ht-c\"}"));
+
+    fail_journal.enabled = true;
+    n00b_store_range_cancel_fails_set(true);
+    out.batch_r = n00b_store_ingest_buf_batch(out.store,
+                                              sources,
+                                              .worker_count   = 2,
+                                              .queue_capacity = 1);
+    n00b_store_range_cancel_fails_set(false);
+    fail_journal.enabled = false;
+    return out;
+}
+
+// The journaled prefix is committed even when the tail stays reserved, so the
+// live shard holds what the journal holds. The store is abandoned rather than
+// closed: its tail is still reserved.
+static void
+test_held_tail_still_commits_the_journaled_prefix(void)
+{
+    held_tail_t held = batch_with_a_held_tail();
+
+    auto memory_r = n00b_store_memory_stats(held.store);
+    CHECK(n00b_result_is_ok(memory_r));
+    n00b_store_memory_stats_t memory = n00b_result_get(memory_r);
+    CHECK(memory.hot_live_index == 1);
+    CHECK(memory.hot_record_count == 3);
+    CHECK(memory.hot_active_writers == 0);
+
+    n00b_store_t *recovered =
+        open_store(schema_with_level(false, N00B_STORE_INDEX_TERM),
+                   .vfs              = held.vfs,
+                   .recovery_journal = true);
+    n00b_store_catalog_entry_t *entry = catalog_shard(recovered, 1);
+    auto records_r = n00b_store_catalog_entry_get_record_count(entry);
+    CHECK(n00b_result_is_ok(records_r));
+    CHECK(n00b_result_get(records_r) == 1);
+    close_store_ok(recovered);
+}
+
+// The batch reports the journal error that stopped the range, not the failed
+// cancel that followed it.
+static void
+test_held_tail_reports_the_failure_that_stopped_it(void)
+{
+    held_tail_t held = batch_with_a_held_tail();
+    CHECK(n00b_result_is_err(held.batch_r));
+    CHECK(n00b_result_get_err(held.batch_r) == N00B_STORE_ERR_VFS);
+}
+#endif
+
 int
 main(int argc, char *argv[])
 {
@@ -1055,6 +1135,8 @@ main(int argc, char *argv[])
 #ifdef N00B_DEBUG
     test_worker_range_tombstone_is_indexed();
     test_worker_range_tombstone_survives_an_index_failure();
+    test_held_tail_still_commits_the_journaled_prefix();
+    test_held_tail_reports_the_failure_that_stopped_it();
 #endif
 
     return 0;

@@ -457,6 +457,14 @@ typedef bool (*n00b_store_range_prepare_fail_hook_t)(n00b_json_node_t *record,
 extern void
 n00b_store_range_prepare_fail_hook_set(n00b_store_range_prepare_fail_hook_t hook,
                                        void                                *ctx);
+
+/**
+ * @brief Make the batch range commit's release of an unready tail fail, as
+ *        though the reservation could not be canceled. Only under
+ *        @c N00B_DEBUG.
+ */
+extern void
+n00b_store_range_cancel_fails_set(bool fails);
 #endif
 
 /**
