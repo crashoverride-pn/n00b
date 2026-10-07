@@ -33,8 +33,19 @@ n00b_align_to_page_start(void *addr)
 #if __has_include(<stdbit.h>)
 #include <stdbit.h>
 #else
-#define stdc_bit_ceil_ull(x)  (1ULL << (64 - __builtin_clzll(x)))
-#define stdc_bit_floor_ull(x) (1ULL << (63 - __builtin_clzll(x)))
+// C23 semantics: 1 for 0 and 1, and 0 when the result does not fit. Only
+// x - 1 >= 1 reaches the builtin, which is undefined at 0.
+static inline unsigned long long
+stdc_bit_ceil_ull(unsigned long long x)
+{
+    return x <= 1 ? 1 : 2ULL << (63 - __builtin_clzll(x - 1));
+}
+
+static inline unsigned long long
+stdc_bit_floor_ull(unsigned long long x)
+{
+    return x == 0 ? 0 : 1ULL << (63 - __builtin_clzll(x));
+}
 #endif
 
 #define n00b_align_closest_pow2_floor(value) stdc_bit_floor_ull((unsigned long long int)(value))

@@ -6,6 +6,7 @@
 #include "core/alloc.h"
 #include "core/runtime.h"
 #include "core/buffer.h"
+#include "util/math.h"
 
 // ============================================================================
 // 1. Construction -- empty, sized, from-bytes
@@ -470,6 +471,134 @@ test_from_cstr(void)
 }
 
 // ============================================================================
+// 17. Power-of-two rounding -- the size every grow path allocates
+// ============================================================================
+
+static uint64_t
+ref_pow2_ceil(uint64_t x)
+{
+    uint64_t p = 1;
+    while (p < x) {
+        p <<= 1;
+    }
+    return p;
+}
+
+static uint64_t
+ref_pow2_floor(uint64_t x)
+{
+    if (x == 0) {
+        return 0;
+    }
+    uint64_t p = 1;
+    while (p <= x / 2) {
+        p <<= 1;
+    }
+    return p;
+}
+
+// Returns the number of mismatches for x, printing each one.
+static int
+check_pow2_rounding(uint64_t x)
+{
+    uint64_t got_ceil  = n00b_align_closest_pow2_ceil(x);
+    uint64_t got_floor = n00b_align_closest_pow2_floor(x);
+    int      bad       = 0;
+
+    if (x <= (UINT64_C(1) << 63) && got_ceil != ref_pow2_ceil(x)) {
+        fprintf(stderr, "pow2_ceil(%llu) = %llu, want %llu\n",
+                (unsigned long long)x, (unsigned long long)got_ceil,
+                (unsigned long long)ref_pow2_ceil(x));
+        bad++;
+    }
+    if (got_floor != ref_pow2_floor(x)) {
+        fprintf(stderr, "pow2_floor(%llu) = %llu, want %llu\n",
+                (unsigned long long)x, (unsigned long long)got_floor,
+                (unsigned long long)ref_pow2_floor(x));
+        bad++;
+    }
+    return bad;
+}
+
+static void
+test_pow2_rounding(void)
+{
+    // A volatile source keeps every row a runtime computation, as the grow
+    // paths' sizes are.
+    volatile uint64_t zero = 0;
+    int               bad  = check_pow2_rounding(zero);
+
+    for (int k = 0; k < 64; k++) {
+        uint64_t p = UINT64_C(1) << k;
+        bad += check_pow2_rounding(zero + p - 1);
+        bad += check_pow2_rounding(zero + p);
+        bad += check_pow2_rounding(zero + p + 1);
+    }
+    bad += check_pow2_rounding(zero + UINT64_MAX);
+    assert(bad == 0);
+
+    // Resizing an aliasing buffer to 0 copies it into an allocation sized by
+    // rounding 0.
+    n00b_buffer_t *buf = n00b_buffer_from_bytes("abc", 3);
+    buf->flags |= N00B_BUF_F_BORROWED;
+    n00b_buffer_resize(buf, zero);
+    assert(n00b_buffer_len(buf) == 0);
+    assert(buf->alloc_len == 1);
+    assert(!(buf->flags & N00B_BUF_F_BORROWED));
+    n00b_buffer_free(buf);
+
+    printf("  [PASS] pow2 rounding\n");
+}
+
+// stdc_leading_zeros and stdc_trailing_zeros against C23: a zero operand
+// counts every bit of its type, and narrow operands count within their own
+// width. Values pass through volatiles so every row is computed at run time.
+static int
+check_bit_count(const char *what, unsigned int got, unsigned int want)
+{
+    if (got == want) {
+        return 0;
+    }
+    printf("  [FAIL] %s: got %u, want %u\n", what, got, want);
+    return 1;
+}
+
+static void
+test_bit_counts(void)
+{
+    volatile unsigned long long v64 = 0;
+    volatile unsigned int       v32 = 0;
+    volatile unsigned short     v16 = 0;
+    volatile unsigned char      v8  = 0;
+
+    unsigned long long z64 = v64, one64 = v64 + 1, top64 = (v64 + 1) << 63;
+    unsigned int       z32 = v32, one32 = v32 + 1;
+    unsigned short     z16 = v16, one16 = (unsigned short)(v16 + 1);
+    unsigned short     top16 = (unsigned short)((v16 + 1) << 15);
+    unsigned char      z8 = v8, one8 = (unsigned char)(v8 + 1);
+
+    int bad = 0;
+    bad += check_bit_count("clz64(0)", stdc_leading_zeros(z64), 64);
+    bad += check_bit_count("clz64(1)", stdc_leading_zeros(one64), 63);
+    bad += check_bit_count("clz64(2^63)", stdc_leading_zeros(top64), 0);
+    bad += check_bit_count("clz32(0)", stdc_leading_zeros(z32), 32);
+    bad += check_bit_count("clz32(1)", stdc_leading_zeros(one32), 31);
+    bad += check_bit_count("clz16(0)", stdc_leading_zeros(z16), 16);
+    bad += check_bit_count("clz16(1)", stdc_leading_zeros(one16), 15);
+    bad += check_bit_count("clz8(0)", stdc_leading_zeros(z8), 8);
+    bad += check_bit_count("clz8(1)", stdc_leading_zeros(one8), 7);
+    bad += check_bit_count("ctz64(0)", stdc_trailing_zeros(z64), 64);
+    bad += check_bit_count("ctz64(2^63)", stdc_trailing_zeros(top64), 63);
+    bad += check_bit_count("ctz32(0)", stdc_trailing_zeros(z32), 32);
+    bad += check_bit_count("ctz16(0)", stdc_trailing_zeros(z16), 16);
+    bad += check_bit_count("ctz16(2^15)", stdc_trailing_zeros(top16), 15);
+    bad += check_bit_count("ctz8(0)", stdc_trailing_zeros(z8), 8);
+    assert(bad == 0);
+
+    printf("  [PASS] bit counts\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -497,6 +626,8 @@ main(int argc, char **argv)
     test_free();
     test_to_c();
     test_from_cstr();
+    test_pow2_rounding();
+    test_bit_counts();
 
     printf("All buffer tests passed.\n");
     n00b_shutdown();

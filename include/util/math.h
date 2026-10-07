@@ -11,14 +11,31 @@
 #if __has_include(<stdbit.h>)
 #include <stdbit.h>
 #else
-#define stdc_leading_zeros(x) _Generic((x), \
-    unsigned long long: __builtin_clzll, \
-    unsigned long: __builtin_clzl, \
-    default: __builtin_clz)(x)
-#define stdc_trailing_zeros(x) _Generic((x), \
-    unsigned long long: __builtin_ctzll, \
-    unsigned long: __builtin_ctzl, \
-    default: __builtin_ctz)(x)
+// C23 semantics: a zero operand counts every bit of its type, and an 8- or
+// 16-bit operand counts within its own width. Only nonzero values reach the
+// builtins, which are undefined at 0.
+static inline unsigned int
+_n00b_leading_zeros(unsigned long long x, unsigned int width)
+{
+    if (width < 64) {
+        x &= (1ULL << width) - 1;
+    }
+    return x == 0 ? width : (unsigned int)__builtin_clzll(x) - (64 - width);
+}
+
+static inline unsigned int
+_n00b_trailing_zeros(unsigned long long x, unsigned int width)
+{
+    if (width < 64) {
+        x &= (1ULL << width) - 1;
+    }
+    return x == 0 ? width : (unsigned int)__builtin_ctzll(x);
+}
+
+#define stdc_leading_zeros(x) \
+    _n00b_leading_zeros((unsigned long long)(x), (unsigned int)(8 * sizeof(x)))
+#define stdc_trailing_zeros(x) \
+    _n00b_trailing_zeros((unsigned long long)(x), (unsigned int)(8 * sizeof(x)))
 #define stdc_count_ones(x) _Generic((x), \
     unsigned long long: __builtin_popcountll, \
     unsigned long: __builtin_popcountl, \

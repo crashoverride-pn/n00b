@@ -283,11 +283,16 @@ jobs:
           # nanosleep, and the fd-redirect helper drives SetStdHandle as well
           # as _dup2 -- the raw fallback resolves fd 1/2 through GetStdHandle,
           # which _dup2 does not touch.
+          # buffer is in the list for the <stdbit.h> fallbacks in core/align.h
+          # and util/math.h, which test_buffer checks against C23. This build
+          # has no <stdbit.h>, and on x86-64 a count of leading zeros of 0 is
+          # where those fallbacks are undefined, so this is the one lane
+          # where getting them wrong shows.
           $suiteArgs = @('--no-suite', 'known-broken', '--no-suite', 'stress')
           $rocsDict = (meson test -C build_windows_component @suiteArgs --list) |
             ForEach-Object { ($_ -split ':')[-1].Trim() } |
             Where-Object { $_ -match '^(rocs|dict|file_io|print)' }
-          $testNames = @('condition', 'gc', 'gc_pin_all') + $rocsDict
+          $testNames = @('condition', 'gc', 'gc_pin_all', 'buffer') + $rocsDict
 
           # Build ONLY the tests that are about to run, not `ninja all`.
           #
@@ -346,7 +351,7 @@ jobs:
           # --no-rebuild: meson would otherwise run `ninja all` itself before
           # testing, reintroducing exactly the compile failures avoided above.
           meson test -C build_windows_component --print-errorlogs --no-rebuild `
-            --num-processes 4 @suiteArgs condition gc gc_pin_all @rocsDict
+            --num-processes 4 @suiteArgs condition gc gc_pin_all buffer @rocsDict
           if ($LASTEXITCODE -ne 0) { throw "n00b Windows test suite failed with exit code $LASTEXITCODE" }
 
       - name: Upload validation evidence
